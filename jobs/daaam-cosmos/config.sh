@@ -12,7 +12,7 @@
 # rather than being special-cased inside bin/bjob itself.
 # If it must run on a thin card anyway, lower the knob further:
 # COSMOS_GPU_MEMORY_UTILIZATION=0.6 (and drop D_CONSTRAINT below).
-D_ACCOUNT="berzelius-2026-211"
+D_ACCOUNT=""   # blank: resolved from local.config.json (site.sh), or auto-detected
 D_PARTITION="berzelius"
 D_GPUS="1"
 D_TIME="00:59:59"

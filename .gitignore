@@ -7,3 +7,6 @@
 # regenerable build artifacts
 __pycache__/
 *.pyc
+
+# your SLURM account + project group — see local.config.json.example
+local.config.json

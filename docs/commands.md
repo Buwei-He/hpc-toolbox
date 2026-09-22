@@ -15,7 +15,7 @@ python3 /ros2_ws/tools/create_egg_bag.py \
 
 ## EGG dataset (HC-DAAAM, manual)
 
-export PROJECT=/proj/rpl-soro/users/$USER
+export PROJECT=/proj/<your-group>/users/$USER   # or just: bjob (sets it for you)
 
 apptainer shell --nv \
     -B $PROJECT/ros2_ws:/ros2_ws \
@@ -88,14 +88,14 @@ python3 /ros2_ws/src/daaam/scripts/demo_query.py \
  
 ## Merge multiple batch outputs into a single queryable result
 
-python3 /proj/rpl-soro/users/x_ermba/ros2_ws/src/daaam/scripts/merge_dsgs.py \
-/proj/rpl-soro/users/x_ermba/ros2_ws/src/daaam/output/egg/20260610/egg_batch_1_out_20260610_162220 \
-/proj/rpl-soro/users/x_ermba/ros2_ws/src/daaam/output/egg/20260610/egg_batch_2_out_20260610_163159 \
-/proj/rpl-soro/users/x_ermba/ros2_ws/src/daaam/output/egg/20260610/egg_batch_3_out_20260610_164926 \
-/proj/rpl-soro/users/x_ermba/ros2_ws/src/daaam/output/egg/20260610/egg_batch_4_out_20260610_165700 \
-/proj/rpl-soro/users/x_ermba/ros2_ws/src/daaam/output/egg/20260610/egg_batch_5_out_20260610_170813 \
-/proj/rpl-soro/users/x_ermba/ros2_ws/src/daaam/output/egg/20260610/egg_batch_6_out_20260610_172234 \
-/proj/rpl-soro/users/x_ermba/ros2_ws/src/daaam/output/egg/20260610/egg_batch_7_out_20260610_173117 \
+python3 $PROJECT/ros2_ws/src/daaam/scripts/merge_dsgs.py \
+$PROJECT/ros2_ws/src/daaam/output/egg/20260610/egg_batch_1_out_20260610_162220 \
+$PROJECT/ros2_ws/src/daaam/output/egg/20260610/egg_batch_2_out_20260610_163159 \
+$PROJECT/ros2_ws/src/daaam/output/egg/20260610/egg_batch_3_out_20260610_164926 \
+$PROJECT/ros2_ws/src/daaam/output/egg/20260610/egg_batch_4_out_20260610_165700 \
+$PROJECT/ros2_ws/src/daaam/output/egg/20260610/egg_batch_5_out_20260610_170813 \
+$PROJECT/ros2_ws/src/daaam/output/egg/20260610/egg_batch_6_out_20260610_172234 \
+$PROJECT/ros2_ws/src/daaam/output/egg/20260610/egg_batch_7_out_20260610_173117 \
 --output /ros2_ws/src/daaam/output/egg/20260610/merged_egg_v1
 
 

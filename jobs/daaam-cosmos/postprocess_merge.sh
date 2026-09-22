@@ -27,7 +27,7 @@
 #   FORCE_SUMMARIZE     re-run even if region_summaries.yaml exists
 #
 # Other env vars:
-#   PROJECT           default: /proj/rpl-soro/users/$USER
+#   PROJECT           required; set via local.config.json (see berzelius-toolbox/README.md)
 #   OPENAI_API_KEY    required for GPT semantic judge and summarize step;
 #                     summarize is skipped if unset
 #   SUMMARIZE_MODEL   default: gpt-5.4-mini
@@ -50,7 +50,7 @@
 
 set -euo pipefail
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 _SCRIPT_PROJECT="$PROJECT"
 _REQUESTED_INTERACTIVE="${INTERACTIVE:-1}"
 

@@ -12,17 +12,23 @@ a job that won't start.
 
 ```
 berzelius-toolbox/
-├── CLAUDE.md         # Contract for agents + tool index (read this first)
+├── CLAUDE.md                  # Contract for agents + tool index (read this first)
+├── local.config.json.example  # Template — copy to local.config.json (gitignored) and fill in
 ├── bin/
 │   ├── bjob          # Interactive SLURM job manager (needs a TTY)
 │   ├── percorso-demo # Live-demo service manager (run bag|live, stream/pipeline/bag/snapshot/power)
 │   ├── toolbox-doctor# Lint for CPU-spin hazards, runaway processes, quota
-│   └── lib/          # Sourced-only helpers shared between tools (not linked into ~/bin)
+│   └── lib/          # Sourced-only helpers shared between tools (not linked into ~/bin),
+│                     # including site.sh — loads local.config.json
 ├── docs/
 │   ├── quickstart.md # Short, human-first: running a profile, why jobs pend, how to get unstuck
 │   └── commands.md   # Common commands / workflow notes
 └── jobs/             # Saved bjob profiles
 ```
+
+Nothing account- or project-identifying lives in tracked files — your SLURM
+account and project group live only in `local.config.json` (gitignored, see
+Setup below). That's what makes this safe to keep in a repo you might share.
 
 Version-controlled with git since 2026-08-21. Manual pre-edit copies
 (`.bak_*` files, `.bjob-backups/`) predate that and are kept for history, but
@@ -33,10 +39,13 @@ risky edit.
 
 ```bash
 export PATH="$HOME/bin:$PATH"
-PROJECT=/proj/rpl-soro/users/$USER
-ln -sf $PROJECT/berzelius-toolbox/bin/bjob           ~/bin/bjob
-ln -sf $PROJECT/berzelius-toolbox/bin/percorso-demo  ~/bin/percorso-demo
-ln -sf $PROJECT/berzelius-toolbox/bin/toolbox-doctor ~/bin/toolbox-doctor
+# TOOLBOX = wherever you actually cloned this, e.g. /proj/<your-group>/users/$USER/berzelius-toolbox
+ln -sf $TOOLBOX/bin/bjob           ~/bin/bjob
+ln -sf $TOOLBOX/bin/percorso-demo  ~/bin/percorso-demo
+ln -sf $TOOLBOX/bin/toolbox-doctor ~/bin/toolbox-doctor
+
+cp $TOOLBOX/local.config.json.example $TOOLBOX/local.config.json
+$EDITOR $TOOLBOX/local.config.json   # fill in your slurm_account + project_group
 # ssh-helper is the robot/laptop side and lives in a different repo — see
 # ros2_ws/src/percorso-perception/tools/README.md, not this toolbox.
 ```

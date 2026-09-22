@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 # SLURM copies scripts to a temp dir, so BASH_SOURCE[0] won't point here.
 # bjob passes the real path via --export=...,DAAAM_PROFILE_DIR=...
 PROFILE_DIR="${DAAAM_PROFILE_DIR:?DAAAM_PROFILE_DIR must be set via --export}"
@@ -83,7 +83,7 @@ _on_exit() {
         | tee -a "$LOG_DIR/auto_launch.log"
 
     sbatch \
-        --account="${SLURM_JOB_ACCOUNT:-berzelius-2026-211}" \
+        --account="${SLURM_JOB_ACCOUNT:?SLURM_JOB_ACCOUNT should always be set inside a running job}" \
         --partition="${SLURM_JOB_PARTITION:-berzelius}" \
         --gpus="${DAAAM_SBATCH_GPUS}" \
         --time=00:59:59 \

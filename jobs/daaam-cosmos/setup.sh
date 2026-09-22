@@ -3,7 +3,7 @@
 # Holds one GPU allocation open. Use `bjob connect <jobid>` from IDE
 # terminals to choose Cosmos, a prepared DAAAM shell, plain shell, or GPU status.
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 export HOI_FPS="${HOI_FPS:-4.0}"
 export COSMOS_GPU_MEMORY_UTILIZATION="${COSMOS_GPU_MEMORY_UTILIZATION:-0.75}"
 export COSMOS_URL_FILE="${COSMOS_URL_FILE:-$PROJECT/.cosmos_url.${SLURM_JOB_ID:-manual}}"

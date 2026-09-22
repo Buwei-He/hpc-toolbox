@@ -4,7 +4,7 @@
 # Activates the vLLM env, starts the LLaVA-OneVision-2-8B server in the
 # background on 0.0.0.0:8000, then drops you to an interactive shell.
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 
 # Environment
 module load Miniforge3/24.7.1-2-hpc1-bdist

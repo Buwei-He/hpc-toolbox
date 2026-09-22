@@ -32,7 +32,7 @@
 #     put both on one node, where a shared port 8000 gives
 #     "OSError: [Errno 98] Address already in use").
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 
 SIF="${COSMOS3_SIF:-$PROJECT/llm/images/vllm-openai-v0.27.1.sif}"
 MODEL="${COSMOS3_MODEL:-nvidia/Cosmos3-Nano}"

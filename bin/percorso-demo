@@ -10,10 +10,13 @@
 # demo path. Run this INSIDE a SLURM job on a compute node.
 #
 #   percorso-demo doctor              verify the demo code is what will actually run
-#   percorso-demo run bag [batch] [--snapshot[=N]]  mock test, one command
-#   percorso-demo run live [--snapshot[=N]]         real demo, one command
+#   percorso-demo run bag [batch] [--snapshot[=N]] [--cosmos reason2|nano]  mock test
+#   percorso-demo run live [--snapshot[=N]] [--cosmos reason2|nano]        real demo
 #     --snapshot[=N]: also poll the query bridge every N sec (default 30) and
 #     write dsg.json/events.yaml snapshots — see tools/snapshot_poller.py.
+#     --cosmos: which HOI reasoning backend to query (default reason2) —
+#     'reason2' = cosmos-reason2 job (port 8000), 'nano' = cosmos3-nano-reasoner
+#     job (port 8001). Either must already be running (bjob submit <profile>).
 #   percorso-demo status              what is running on THIS node, and is it healthy
 #   percorso-demo where               print the paths this tool uses
 #   percorso-demo overlay             one-time: build the demo ROS overlay
@@ -51,7 +54,8 @@ set -uo pipefail
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 INVOKED_AS="${BASH_SOURCE[0]}"
 
-PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+source "$(dirname "$SELF")/lib/site.sh"
+PROJECT="${PROJECT:?PROJECT not set — copy local.config.json.example to local.config.json and fill in project_group, or export PROJECT yourself}"
 SIF="${PERCORSO_SIF:-$PROJECT/containers/daaam.sif}"
 OVERLAY="${PERCORSO_OVERLAY:-$PROJECT/percorso_overlay}"
 DEMO_LIB="${PERCORSO_DEMO_LIB:-/ros2_ws/src/percorso-perception/src}"
@@ -138,9 +142,23 @@ require_job() {
         "login nodes must not run the pipeline"
 }
 
+# Two interchangeable cosmos backends, chosen with `run --cosmos reason2|nano`
+# (default reason2, or $PERCORSO_COSMOS). Each writes its own URL file so
+# both jobs can be up at once without clobbering each other — see
+# jobs/cosmos-reason2/setup.sh and jobs/cosmos3-nano-reasoner/setup.sh.
+cosmos_backend_spec() {
+    case "${1:-${PERCORSO_COSMOS:-reason2}}" in
+        reason2) printf '%s\t%s/.cosmos_url\t8000' cosmos-reason2 "$PROJECT" ;;
+        nano)    printf '%s\t%s/.cosmos3_url\t8001' cosmos3-nano-reasoner "$PROJECT" ;;
+        *)       die "unknown cosmos backend '$1'" "use 'reason2' or 'nano'" ;;
+    esac
+}
+
 cosmos_url() {
     if [ -n "${COSMOS_URL:-}" ]; then printf '%s' "$COSMOS_URL"; return; fi
-    [ -s "$PROJECT/.cosmos_url" ] && tr -d '\n' < "$PROJECT/.cosmos_url"
+    local jobname urlfile port
+    IFS=$'\t' read -r jobname urlfile port < <(cosmos_backend_spec) || return 1
+    [ -s "$urlfile" ] && tr -d '\n' < "$urlfile"
 }
 
 # Exact job-name match, not a substring: 'cosmos' would also match 'daaam-cosmos'
@@ -148,31 +166,34 @@ cosmos_url() {
 # squeue in there, which is why the URL travels through a file at all.
 cosmos_node() {
     command -v squeue >/dev/null 2>&1 || return 1
+    local jobname urlfile port
+    IFS=$'\t' read -r jobname urlfile port < <(cosmos_backend_spec) || return 1
     squeue -u "$USER" -h -o "%j|%T|%N" 2>/dev/null \
-      | awk -F'|' '$1=="cosmos-reason2" && $2=="RUNNING" && $3!="" {print $3; exit}'
+      | awk -F'|' -v j="$jobname" '$1==j && $2=="RUNNING" && $3!="" {print $3; exit}'
 }
 
-# Called only when the recorded URL does not answer. $PROJECT/.cosmos_url is written
+# Called only when the recorded URL does not answer. The url file is written
 # by cosmos at boot, so after a job restart it can name a node that runs nothing —
 # the "came back days later, no idea where to start" case. Say which of the two it
 # is instead of just "not answering".
 cosmos_diagnose() {
-    local url="$1" host node
+    local url="$1" host node jobname urlfile port
+    IFS=$'\t' read -r jobname urlfile port < <(cosmos_backend_spec)
     host=${url#*://}; host=${host%%:*}
     if node=$(cosmos_node) && [ -n "$node" ]; then
         if [ "$node" != "$host" ]; then
-            note "SLURM says cosmos-reason2 runs on '$node', but the URL names '$host'"
+            note "SLURM says $jobname runs on '$node', but the URL names '$host'"
             note "the recorded URL is stale — cosmos rewrites it at boot"
-            note "use the live one:  export COSMOS_URL=http://$node:8000/v1"
+            note "use the live one:  export COSMOS_URL=http://$node:$port/v1"
         else
-            note "cosmos-reason2 is on $node but not answering yet — still loading weights?"
+            note "$jobname is on $node but not answering yet — still loading weights?"
         fi
         return
     fi
-    [ -s "$PROJECT/.cosmos_url" ] \
-        && note "recorded $(date -r "$PROJECT/.cosmos_url" '+%Y-%m-%d %H:%M') in \$PROJECT/.cosmos_url"
+    [ -s "$urlfile" ] \
+        && note "recorded $(date -r "$urlfile" '+%Y-%m-%d %H:%M') in $urlfile"
     if command -v squeue >/dev/null 2>&1; then
-        note "no RUNNING cosmos-reason2 job — start it:  bjob"
+        note "no RUNNING $jobname job — start it:  bjob submit $jobname"
     else
         note "no squeue in the container; check from a login node:  squeue -u $USER"
         note "if cosmos just started, the URL file is rewritten at boot — wait and retry"
@@ -361,8 +382,10 @@ cmd_doctor() {
             fails=$((fails+1))
         fi
     else
-        warn "no cosmos URL — \$PROJECT/.cosmos_url is missing"
-        note "start it:  bjob → cosmos-reason2"
+        local jobname urlfile port
+        IFS=$'\t' read -r jobname urlfile port < <(cosmos_backend_spec)
+        warn "no cosmos URL — $urlfile is missing"
+        note "start it:  bjob submit $jobname"
         fails=$((fails+1))
     fi
 
@@ -480,10 +503,10 @@ cmd_pipeline() {
     done
     require_job
     local cu; cu=$(cosmos_url)
-    [ -n "$cu" ] || die "no cosmos URL" "start cosmos first, or export COSMOS_URL=http://<node>:8000/v1"
+    [ -n "$cu" ] || die "no cosmos URL" "start cosmos first (bjob submit cosmos-reason2|cosmos3-nano-reasoner), or export COSMOS_URL=http://<node>:<port>/v1"
 
     printf "percorso-demo pipeline — run '%s' on %s\n" "$label" "$(hostname -s)"
-    note "cosmos:  $cu"
+    note "cosmos:  $cu (backend: ${PERCORSO_COSMOS:-reason2})"
     note "bridge:  http://$(hostname -s):$BRIDGE_PORT"
     note "frames: percorso-demo stream (remote robot), or bag (local)"
     note "from your laptop:  ssh-helper connect <node> bridge"
@@ -577,7 +600,7 @@ cmd_bag() {
 # below still exist for manual control (debugging, a non-default batch mid-run,
 # scripting).
 cmd_run() {
-    local usage="run takes: bag [batch] [--loop] [--snapshot[=N]] | live [--bg] [--snapshot[=N]]"
+    local usage="run takes: bag [batch] [--loop] [--snapshot[=N]] [--cosmos reason2|nano] | live [--bg] [--snapshot[=N]] [--cosmos reason2|nano]"
     local mode="${1:?$usage}"; shift
     local batch="$BATCH" loop="" bg="" snapshot_interval=""
     while [ $# -gt 0 ]; do
@@ -586,11 +609,15 @@ cmd_run() {
             --snapshot=*) snapshot_interval="${1#--snapshot=}" ;;
             --loop)       loop="--loop" ;;
             --bg)         bg=1 ;;
+            --cosmos)     PERCORSO_COSMOS="${2:?--cosmos needs reason2 or nano}"; shift ;;
+            --cosmos=*)   PERCORSO_COSMOS="${1#--cosmos=}" ;;
             -*)           die "unknown option '$1'" "$usage" ;;
             *)            batch="$1" ;;
         esac
         shift
     done
+    cosmos_backend_spec "${PERCORSO_COSMOS:-}" >/dev/null
+    export PERCORSO_COSMOS="${PERCORSO_COSMOS:-reason2}"
 
     case "$mode" in
         bag)
@@ -915,8 +942,8 @@ case "${1:-}" in
 percorso-demo — run the live-demo pipeline: mock test (recorded bag) or real demo (robot)
 
   percorso-demo doctor                verify the DEMO code is what will run
-  percorso-demo run bag [batch] [--loop] [--snapshot[=N]]   mock test, one command
-  percorso-demo run live [--bg] [--snapshot[=N]]            real demo, one command
+  percorso-demo run bag [batch] [--loop] [--snapshot[=N]] [--cosmos reason2|nano]   mock test, one command
+  percorso-demo run live [--bg] [--snapshot[=N]] [--cosmos reason2|nano]            real demo, one command
 
   percorso-demo status                what is running on this node, and is it healthy
   percorso-demo where                 print every path this tool uses
@@ -943,6 +970,8 @@ scripts/export_rerun_output.py --output-dir <snapshot dir>.
 
 quickest path to a mock test, one terminal:
   bjob                                # 'percorso', plus a second job: cosmos-reason2
+                                       # (or cosmos3-nano-reasoner — pass --cosmos nano to 'run'
+                                       # if cosmos-reason2 is stuck pending)
   percorso-demo doctor && percorso-demo run bag batch_7 --snapshot
 
 quickest path to the real demo, one terminal + the robot/laptop:

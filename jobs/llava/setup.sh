@@ -5,7 +5,7 @@
 # the default runtime; build/pull the SIF on a compute node, where Docker-to-SIF
 # conversion works on this cluster.
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 
 module load buildenv-gcccuda/12.1.1-gcc12.3.0
 

@@ -7,7 +7,7 @@
 # matches what percorso-demo runs. Verify any time with: percorso-demo doctor
 set -euo pipefail
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 NODE="${SLURMD_NODENAME:-$(hostname -s)}"
 # Same defaults as percorso-demo, so there is one truth about where things live.
 OVERLAY="${PERCORSO_OVERLAY:-$PROJECT/percorso_overlay}"

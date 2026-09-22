@@ -22,7 +22,8 @@ B='\033[0;34m' C='\033[0;36m' BOLD='\033[1m' DIM='\033[2m' NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 TOOLBOX_DIR="$(dirname "$SCRIPT_DIR")"
 JOBS_DIR="$TOOLBOX_DIR/jobs"
-PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+source "$SCRIPT_DIR/lib/site.sh"
+PROJECT="${PROJECT:?PROJECT not set — copy local.config.json.example to local.config.json and fill in project_group, or export PROJECT yourself}"
 
 source "$SCRIPT_DIR/lib/power.sh"
 source "$SCRIPT_DIR/lib/svc.sh"
@@ -449,8 +450,7 @@ wizard_profile() {
 #!/bin/bash
 # setup.sh for profile: $pname
 # Sourced automatically after your SLURM allocation starts.
-
-export PROJECT=/proj/rpl-soro/users/\$USER
+# \$PROJECT is already set by the time this runs — no need to re-export it.
 
 # ── Apptainer ──────────────────────────────────────────────────────────────
 # apptainer shell --nv \\
@@ -474,7 +474,9 @@ launch_profile() {
     local name="$1"
     load_profile "$name"
 
-    # Auto-detect account if not set in profile
+    # Account resolution: the profile's own D_ACCOUNT, else local.config.json's
+    # slurm_account (site.sh), else auto-detect via sacctmgr as a last resort.
+    [[ -z "${D_ACCOUNT:-}" ]] && D_ACCOUNT="${SITE_ACCOUNT:-}"
     if [[ -z "${D_ACCOUNT:-}" ]]; then
         local detected; detected=$(detect_accounts)
         D_ACCOUNT=$(awk '{print $1}' <<< "$detected")
@@ -803,6 +805,7 @@ cmd_submit() {
         exit 1
     fi
 
+    [[ -z "${D_ACCOUNT:-}" ]] && D_ACCOUNT="${SITE_ACCOUNT:-}"
     if [[ -z "${D_ACCOUNT:-}" ]]; then
         local detected; detected=$(detect_accounts)
         D_ACCOUNT=$(awk '{print $1}' <<< "$detected")
@@ -860,7 +863,7 @@ cmd_submit() {
 
 log_paths() {
     local jobid="$1" jobname="${2:-}"
-    local project="${PROJECT:-/proj/rpl-soro/users/$USER}"
+    local project="$PROJECT"   # already required non-empty at startup
     local log_dir="$project/.cache/bjob-tmux"
     local found=0 file
 

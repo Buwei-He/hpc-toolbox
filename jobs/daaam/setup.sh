@@ -4,7 +4,7 @@
 # Starts a tmux session so bjob/SLURM context is not lost when entering the
 # Apptainer container. New bjob connections get distinct sessions by default.
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 PROFILE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE="${SLURMD_NODENAME:-$(hostname -s)}"
 LOG_DIR="$PROJECT/.cache/bjob-tmux"

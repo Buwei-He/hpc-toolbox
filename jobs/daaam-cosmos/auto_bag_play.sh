@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 ENV_FILE="$PROJECT/.bjob/daaam-cosmos-${SLURM_JOB_ID:-manual}.env"
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 [[ -n "${BJOB_DAAAM_AUTO_BATCH_START:-}" ]] && export DAAAM_AUTO_BATCH_START="$BJOB_DAAAM_AUTO_BATCH_START"

@@ -13,7 +13,7 @@
 # detached either way — see enter_percorso_container.sh for the actual
 # pipeline start; this file only ever creates the session and (maybe) attaches.
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 PROFILE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE="${SLURMD_NODENAME:-$(hostname -s)}"
 LOG_DIR="$PROJECT/.cache/bjob-tmux"

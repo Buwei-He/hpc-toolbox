@@ -22,7 +22,7 @@
 # reason not to co-locate vLLM here.
 # Mem: above 'daaam' (40G) for the rolling buffer, the query bridge and the
 # mid-run event refresh; below 'daaam-cosmos' (80G) because vLLM is not here.
-D_ACCOUNT="berzelius-2026-211"
+D_ACCOUNT=""   # blank: resolved from local.config.json (site.sh), or auto-detected
 D_PARTITION="berzelius"
 D_GPUS="1"
 D_TIME="04:00:00"

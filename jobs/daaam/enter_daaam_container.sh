@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 NODE="${SLURMD_NODENAME:-$(hostname -s)}"
 
 suggest_cosmos_url() {

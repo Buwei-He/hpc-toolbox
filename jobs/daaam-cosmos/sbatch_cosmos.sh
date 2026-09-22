@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-export PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+export PROJECT="${PROJECT:?PROJECT not set -- run this via bjob or percorso-demo, or export PROJECT yourself}"
 # SLURM copies scripts to a temp dir, so BASH_SOURCE[0] won't point here.
 # bjob passes the real path via --export=...,DAAAM_PROFILE_DIR=...
 PROFILE_DIR="${DAAAM_PROFILE_DIR:?DAAAM_PROFILE_DIR must be set via --export}"
