@@ -29,3 +29,6 @@ D_TIME="04:00:00"
 D_MEM="64G"
 D_JOBNAME="percorso"
 D_RESERVATION="safe"
+# A demo idles by nature — the one profile that should sample itself instead
+# of relying on someone remembering to run 'bjob power'/'percorso-demo power'.
+D_POWER_GUARD="1"

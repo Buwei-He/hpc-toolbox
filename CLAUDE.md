@@ -18,13 +18,21 @@ inside application repos like `daaam` / `percorso-perception`.
   job's first hour, NSC `interactive` under 8 h, and reservations (`safe`, `devel` —
   both usable by us). That is why the profiles are `00:59:59`; anything longer needs
   `D_RESERVATION`. Never pad GPU load to defeat this — it is a shared-resource policy
-  and we have already had one warning. Check with `percorso-demo power`.
+  and we have already had one warning. Check with `percorso-demo power` (inside a
+  job) or `bjob power <jobid>` (from anywhere); or set `D_RESERVATION`/`D_POWER_GUARD`
+  on the profile so it watches itself.
+- **Login nodes have a visible GPU too.** Discovered the hard way: an unguarded
+  background `nvidia-smi` sampler run directly (not through `srun`) started for real
+  on `berzelius2` — no allocation required to see or poll it. Anything that starts a
+  detached loop against `nvidia-smi` must check `[[ -n "${SLURM_JOB_ID:-}" ]]` first
+  (see `bjob`'s `power_guard_start`), the same way `percorso-demo`'s `require_job`
+  already does for its own services.
 
 ## Tools
 
 | Command | Agent-safe? | Purpose |
 |---|---|---|
-| `toolbox-doctor` | yes | lint scripts for CPU-spin hazards + find runaway processes |
+| `toolbox-doctor` | yes | lint scripts for CPU-spin hazards + find runaway processes + check disk/file quota |
 | `percorso-demo where` / `doctor` / `status` | yes | locate paths, verify the overlay, see what is running |
 | `percorso-demo zenoh` / `logs <svc>` / `stop <svc>` | yes | detaching service control — returns promptly |
 | `percorso-demo pipeline` / `bag` | **no — long-running** | run the live demo against an EGG rosbag |

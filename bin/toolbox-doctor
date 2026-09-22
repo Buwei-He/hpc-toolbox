@@ -1,10 +1,12 @@
 #!/bin/bash
-# toolbox-doctor — catch the two things that get us in trouble on Berzelius:
-# scripts that can spin a CPU core, and processes already doing it.
+# toolbox-doctor — catch three things that get us in trouble on Berzelius:
+# scripts that can spin a CPU core, processes already doing it, and running
+# out of the disk/file quota NSC enforces on /home and /proj.
 #
-#   toolbox-doctor            both checks
+#   toolbox-doctor            all three checks
 #   toolbox-doctor lint       static: scan bin/ for busy-wait / unguarded TUI
 #   toolbox-doctor procs      runtime: find runaway processes owned by $USER
+#   toolbox-doctor quota      runtime: home + project disk/file quota via nscquota
 #
 # Background: bjob once burned a core for days and drew an admin warning. The
 # cause was `IFS= read -rsn1 key 2>/dev/null || true` inside `while true` — with
@@ -158,17 +160,39 @@ cmd_procs() {
     printf "\n"
 }
 
+# ── quota ─────────────────────────────────────────────────────────────────────
+cmd_quota() {
+    printf "toolbox-doctor quota — %s\n\n" "$USER"
+    if ! command -v nscquota >/dev/null 2>&1; then
+        warn "nscquota not found — skipping (NSC's own quota tool, should be on PATH)"
+        printf "\n"
+        return 0
+    fi
+    if nscquota -w; then
+        ok "quota"
+    else
+        bad "quota — see the table above"
+        note "over on files? find which dir:  find . -type f | cut -d'/' -f2 | sort | uniq -c | sort -nr"
+        note "over on space? drill down with:  ncdu <dir>"
+        note "full picture:  nscquota"
+        FINDINGS=$((FINDINGS + 1))
+    fi
+    printf "\n"
+}
+
 case "${1:-all}" in
     lint)  cmd_lint ;;
     procs) cmd_procs ;;
-    all)   cmd_lint; cmd_procs ;;
+    quota) cmd_quota ;;
+    all)   cmd_lint; cmd_procs; cmd_quota ;;
     *)
         cat <<USAGE
-toolbox-doctor — CPU-spin hazards, static and live
+toolbox-doctor — CPU-spin hazards and quota, static and live
 
-  toolbox-doctor          run both checks
+  toolbox-doctor          run all three checks
   toolbox-doctor lint     scan bin/ for busy-wait / unguarded key reads
   toolbox-doctor procs    find processes whose cpu time tracks wall-clock time
+  toolbox-doctor quota    home + project disk/file quota (via nscquota)
 
 env:
   DOCTOR_MIN_ELAPSED   default 300 (seconds before a process is considered)

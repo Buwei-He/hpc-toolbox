@@ -53,6 +53,40 @@ into `bin/bjob`'s scope. (It doesn't, because `"$(hook_role_env ...)"` runs in
 a subshell.) See `connect_job`'s `_bstart`/`_bend` extraction from `role_env`
 for the pattern if adding a hook that needs to do the same.
 
+## Update — later same day: quota check, power guard, ports.conf contract
+
+Three more additions, same session:
+
+- **`toolbox-doctor quota`** wraps NSC's own `nscquota` (home + project
+  block/file quota, `-w` for silent-unless-exceeded). `/proj` and `/home` are
+  VAST-backed, not Lustre, so `lfs quota` was never going to work here.
+- **`bin/lib/svc.sh`** — pulled the container-independent half of
+  `percorso-demo`'s `svc_*` functions (pidfile/logfile/pid/start/stop/
+  wait-port) out into a second sourced-only lib next to `bin/lib/power.sh`.
+  `percorso-demo` keeps a thin `svc_start_container` wrapper on top for the
+  one thing that's actually specific to it: every service there runs inside
+  an apptainer container.
+- **`D_POWER_GUARD="1"`** — a profile config key. `launch_profile` appends a
+  line to the rc file it already builds for `setup.sh`, re-invoking `bjob
+  __power-guard-start` (a hidden, undocumented subcommand — not part of the
+  CLI contract) once inside the allocation. That starts a detached sampler
+  via the two shared libs above, logged under `$PROJECT/.bjob/run/<node>/`.
+  Enabled on `percorso` (the profile that legitimately idles). **Caught
+  while testing:** `power_guard_start` had no guard against running outside
+  a SLURM allocation, and this login node has a visible GPU — a direct
+  invocation started a real unbounded `nvidia-smi -l 60` loop here before a
+  `[[ -n "${SLURM_JOB_ID:-}" ]]` check was added. Exactly the class of bug
+  `toolbox-doctor` exists to catch; if you touch this function again, retest
+  with `bjob __power-guard-start` on a login node and confirm it no-ops.
+- **`jobs/<name>/ports.conf`** — new, `<svc> <port> [priority]` per line,
+  added to `percorso`/`cosmos-reason2`/`daaam-cosmos`. Nothing reads these
+  yet; they exist so a future rewrite of `percorso-net` (different repo,
+  robot/laptop side) has a correct, single-sourced service/port declaration
+  to consume instead of its own hardcoded job-name map. Known gap, called
+  out in `jobs/daaam-cosmos/ports.conf`: the AFK/sbatch launch mode submits
+  jobs named `cosmos-server`/`daaam-worker`, which have no `jobs/<name>/`
+  directory to hold a declaration.
+
 ---
 
 ## 1. What it is for

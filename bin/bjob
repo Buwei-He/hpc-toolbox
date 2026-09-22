@@ -24,6 +24,11 @@ JOBS_DIR="$TOOLBOX_DIR/jobs"
 PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
 
 source "$SCRIPT_DIR/lib/power.sh"
+source "$SCRIPT_DIR/lib/svc.sh"
+SVC_RUN_DIR="$PROJECT/.bjob/run/$(hostname -s)"
+ok()   { printf "${G}  ok${NC}    %s\n" "$*"; }
+warn() { printf "${Y}  warn${NC}  %s\n" "$*"; }
+note() { printf "${DIM}        %s${NC}\n" "$*"; }
 
 mkdir -p "$JOBS_DIR"
 leave_alt_screen() {
@@ -154,6 +159,7 @@ D_TIME="$D_TIME"
 D_MEM="$D_MEM"
 D_JOBNAME="$name"
 ${D_RESERVATION:+D_RESERVATION=\"$D_RESERVATION\"}
+${D_POWER_GUARD:+D_POWER_GUARD=\"$D_POWER_GUARD\"}
 EOF
 }
 
@@ -170,6 +176,7 @@ profile_line() {
         local flags=""
         [[ -f "$JOBS_DIR/$name/setup.sh" ]] && flags="setup"
         [[ -n "${D_RESERVATION:-}" ]] && flags="${flags:+$flags }res:$D_RESERVATION"
+        [[ -n "${D_POWER_GUARD:-}" ]] && flags="${flags:+$flags }guard"
         local line
         if (( width < 42 )); then
             line="${name} ${D_TIME:-?} ${size} ${flags}"
@@ -495,10 +502,12 @@ launch_profile() {
 
     local setup="$JOBS_DIR/$name/setup.sh"
     local exit_code=0
-    if [[ -f "$setup" ]]; then
-        printf "${C}  setup.sh found — will be sourced after login.${NC}\n\n"
+    if [[ -f "$setup" || -n "${D_POWER_GUARD:-}" ]]; then
+        [[ -f "$setup" ]] && printf "${C}  setup.sh found — will be sourced after login.${NC}\n\n"
         local rc; rc=$(mktemp "$HOME/.bjob_rc_XXXXXX")
-        printf 'cd "%s"\n[[ -f ~/.bashrc ]] && source ~/.bashrc\nsource "%s"\n' "$PROJECT" "$setup" > "$rc"
+        printf 'cd "%s"\n[[ -f ~/.bashrc ]] && source ~/.bashrc\n' "$PROJECT" > "$rc"
+        [[ -f "$setup" ]] && printf 'source "%s"\n' "$setup" >> "$rc"
+        [[ -n "${D_POWER_GUARD:-}" ]] && printf 'bash "%s" __power-guard-start\n' "$SCRIPT_DIR/bjob" >> "$rc"
         srun "${srun_args[@]}" --pty bash --rcfile "$rc" || exit_code=$?
         rm -f "$rc"
     else
@@ -680,6 +689,25 @@ power_status() {
         power_advice; return 1
     fi
     printf "${G}  mean %sW — comfortably above the floor${NC}\n" "$mean"
+}
+
+# Runs on the COMPUTE node, re-invoked as `bjob __power-guard-start` from
+# inside the allocation's rc file (see launch_profile) — not meant to be run
+# directly. Starts a detached, logging-only sampler for the job's lifetime;
+# SLURM tears it down with the rest of the job's cgroup at job end, so there
+# is nothing to stop by hand. Silent no-op if there's no GPU to sample, and —
+# load-bearing — if this isn't inside a SLURM allocation: login nodes here
+# have a visible GPU too, so without this guard an accidental or malicious
+# direct invocation would start an unbounded background nvidia-smi loop on
+# a login node, exactly the spin hazard toolbox-doctor exists to catch.
+power_guard_start() {
+    [[ -n "${SLURM_JOB_ID:-}" ]] || return 0
+    command -v nvidia-smi >/dev/null 2>&1 || return 0
+    local ngpu
+    ngpu=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | grep -c . || true)
+    [[ "${ngpu:-0}" -gt 0 ]] || return 0
+    mkdir -p "$SVC_RUN_DIR"
+    svc_start power-guard "$(power_sample_cmd "$ngpu" 60 watch)" ""
 }
 
 log_paths() {
@@ -938,6 +966,10 @@ case "${1:-}" in
     logs|log)
         [[ $# -ge 2 ]] || { usage; exit 2; }
         log_paths "$2" ;;
+    __power-guard-start)
+        # Internal: invoked from launch_profile's rc file, on the compute
+        # node, inside the allocation. Not part of the CLI contract.
+        power_guard_start ;;
     -h|--help|help)
         usage ;;
     "")

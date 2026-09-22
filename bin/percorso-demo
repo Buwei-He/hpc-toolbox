@@ -69,6 +69,8 @@ warn() { printf "${Y}  warn${NC}  %s\n" "$*"; }
 note() { printf "${DIM}        %s${NC}\n" "$*"; }
 
 source "$(dirname "$SELF")/lib/power.sh"
+source "$(dirname "$SELF")/lib/svc.sh"
+SVC_RUN_DIR="$RUN_DIR"
 die()  { printf "${R}  fail${NC}  %s\n" "$1" >&2; shift || true
          for l in "$@"; do printf "${DIM}        %s${NC}\n" "$l" >&2; done; exit 1; }
 
@@ -161,104 +163,18 @@ cosmos_diagnose() {
 }
 
 # ── background services ───────────────────────────────────────────────────────
-svc_pidfile() { printf '%s/%s.pid' "$RUN_DIR" "$1"; }
-svc_logfile() { printf '%s/%s.log' "$RUN_DIR" "$1"; }
-
-# Prints a live pid, or fails. Deletes a pidfile whose process is gone, so a
-# service that crashed never reports itself as running.
-svc_pid() {
-    local f pid; f=$(svc_pidfile "$1")
-    [ -s "$f" ] || return 1
-    pid=$(cat "$f" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then printf '%s' "$pid"; return 0; fi
-    rm -f "$f"; return 1
-}
-
-# No /dev/tcp here: bash's builtin cannot be given a timeout without a subshell
-# dance, and `timeout` + exec redirection is the readable version.
-tcp_open() { timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
-
-# svc_start <name> <shell-command-run-inside-the-container>
-#
-# The payload is written to a script under $RUN_DIR (bound into the container, so
-# the same file works from both sides) and the child writes its OWN pid. That is
-# deliberate: `$!` after `setsid` is only the payload's pid when setsid happens
-# not to fork, which depends on process-group state we do not control.
-svc_start() {
-    local name="$1" cmd="$2" pid pf lf sh
-    mkdir -p "$RUN_DIR"
-    pf=$(svc_pidfile "$name"); lf=$(svc_logfile "$name"); sh="$RUN_DIR/$name.cmd.sh"
-    if pid=$(svc_pid "$name"); then
-        ok "$name is already running (pid $pid)"
-        note "logs:  percorso-demo logs $name -f"
-        note "stop:  percorso-demo stop $name"
-        return 0
-    fi
-    { container_preamble; printf 'exec %s\n' "$cmd"; } > "$sh"
-    : > "$lf"
-    # setsid gives the payload its own process group, so `kill -- -pid` in
-    # svc_stop reaches the apptainer wrapper AND the real binary under it.
-    if inside_container; then
-        setsid nohup bash -c 'echo $$ > "$1"; exec bash "$2"' _ "$pf" "$sh" >>"$lf" 2>&1 &
-    else
-        local argv=(); mapfile -t argv < <(apptainer_argv)
-        setsid nohup bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pf" \
-               "${argv[@]}" bash "$sh" >>"$lf" 2>&1 &
-    fi
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        [ -s "$pf" ] && break
-        sleep 0.2
-    done
-    if ! pid=$(svc_pid "$name"); then
-        warn "$name did not start"
-        svc_log_tail "$name" 15
-        return 1
-    fi
-    note "$name launched (pid $pid) → $lf"
-    return 0
-}
-
-# Bounded wait for a service to actually answer. Without this the tool would
-# report "started" for a process that is about to exit one line later, which is
-# exactly the "I have to figure it out from the outputs" failure mode.
-svc_wait_port() {
-    local name="$1" port="$2" tries="${3:-15}" i
-    for ((i = 0; i < tries; i++)); do
-        if ! svc_pid "$name" >/dev/null; then
-            warn "$name exited during startup"
-            svc_log_tail "$name" 15
-            return 1
-        fi
-        tcp_open "$port" && return 0
-        sleep 1
-    done
-    warn "$name is running but nothing is listening on 127.0.0.1:$port after ${tries}s"
-    svc_log_tail "$name" 15
-    return 1
-}
-
-svc_log_tail() {
-    local lf; lf=$(svc_logfile "$1")
-    [ -s "$lf" ] || { note "log is empty ($lf)"; return 0; }
-    printf "${DIM}        ── %s (last %s lines) ──${NC}\n" "$lf" "${2:-20}"
-    sed -e 's/^/          /' <(tail -n "${2:-20}" "$lf")
-}
-
-svc_stop() {
-    local name="$1" pid i
-    if ! pid=$(svc_pid "$name"); then
-        note "$name is not running"
-        return 0
-    fi
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-    for ((i = 0; i < 10; i++)); do
-        svc_pid "$name" >/dev/null || { ok "$name stopped"; return 0; }
-        sleep 0.5
-    done
-    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
-    sleep 0.5
-    svc_pid "$name" >/dev/null && { warn "$name (pid $pid) will not die"; return 1; }
-    ok "$name killed"
+# svc_pidfile/logfile/pid/tcp_open/svc_wait_port/svc_log_tail/svc_stop and the
+# generic half of svc_start now live in bin/lib/svc.sh (SVC_RUN_DIR is set to
+# $RUN_DIR above). This wrapper adds the one thing that's specific to this
+# tool: every service here runs inside the apptainer container, so the
+# payload gets container_preamble sourced ahead of it, and — depending on
+# whether we're already inside the shell — either runs directly or through
+# an apptainer_argv-wrapped launcher.
+svc_start_container() {
+    local name="$1" cmd="$2"
+    local -a launcher=()
+    inside_container || mapfile -t launcher < <(apptainer_argv)
+    svc_start "$name" "$cmd" "$(container_preamble)" "${launcher[@]}"
 }
 
 SERVICES="zenoh pipeline bag power ingest"
@@ -604,7 +520,7 @@ cmd_pipeline() {
         in_container "$cmd"
         return
     fi
-    svc_start pipeline "$cmd" || return 1
+    svc_start_container pipeline "$cmd" || return 1
     # Model load + TensorRT warmup dominate here, so allow far longer than zenoh.
     if svc_wait_port pipeline "$BRIDGE_PORT" 180; then
         ok "live query bridge answering on $(hostname -s):$BRIDGE_PORT"
@@ -636,7 +552,7 @@ cmd_bag() {
           --qos-profile-overrides-path /ros2_ws/tools/egg_bag_qos_overrides.yaml $loop"
     if [ -n "$bg" ]; then
         # Nothing to probe: a bag player opens no port. Report the pid and move on.
-        svc_start bag "$cmd" || return 1
+        svc_start_container bag "$cmd" || return 1
         ok "bag replaying in the background"
         note "watch it:  percorso-demo logs bag -f"
         return 0
@@ -676,7 +592,7 @@ cmd_zenoh() {
         return
     fi
 
-    svc_start zenoh "$cmd" || return 1
+    svc_start_container zenoh "$cmd" || return 1
     svc_wait_port zenoh "$ZENOH_PORT" 15 || return 1
     ok "router listening on $(hostname -s):$ZENOH_PORT — this terminal is free"
     printf "\n"
@@ -719,7 +635,7 @@ cmd_power() {
     if [ -n "$watch" ]; then
         # Detached: one line per sample into the service log, so you can leave it
         # running through a demo and read it afterwards.
-        svc_start power "$(power_sample_cmd "$ngpu" "$interval" watch)" || return 1
+        svc_start_container power "$(power_sample_cmd "$ngpu" "$interval" watch)" || return 1
         ok "power watch running (sampling every ${interval}s across $ngpu GPU(s))"
         note "read it:  percorso-demo logs power -f      stop:  percorso-demo stop power"
         return 0
@@ -763,7 +679,7 @@ cmd_ingest() {
     printf "\n"
     local cmd="ros2 run percorso_perception_ros percorso_ingest_node.py --ros-args -p port:=$port"
     if [ -n "$bg" ]; then
-        svc_start ingest "$cmd" && svc_wait_port ingest "$port" 60
+        svc_start_container ingest "$cmd" && svc_wait_port ingest "$port" 60
         return
     fi
     in_container "$cmd"

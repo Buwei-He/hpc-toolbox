@@ -12,7 +12,7 @@ berzelius-toolbox/
 ├── bin/
 │   ├── bjob          # Interactive SLURM job manager (needs a TTY)
 │   ├── percorso-demo # Live-demo service manager (zenoh/pipeline/bag/power)
-│   ├── toolbox-doctor# Lint for CPU-spin hazards + find runaway processes
+│   ├── toolbox-doctor# Lint for CPU-spin hazards, runaway processes, quota
 │   └── lib/          # Sourced-only helpers shared between tools (not linked into ~/bin)
 ├── docs/
 │   └── commands.md   # Common commands / workflow notes
@@ -51,5 +51,14 @@ Run `bjob` from anywhere to:
 - Connect to running jobs with `srun --overlap`
 - Show GPU power/utilization, or sample power against NSC's kill floor
   (`bjob power <jobid>`) for any job — not just the one you're inside
+
+A profile (`jobs/<name>/`) can set `D_POWER_GUARD="1"` in `config.sh` to get
+that power sampling automatically, in the background, for the job's whole
+lifetime — no need to remember to check by hand. It can also carry an
+optional `bjob_hooks.sh` (custom connect roles/launch flow — see
+`docs/HANDOFF_bjob.md`) and a `ports.conf` declaring `<svc> <port>
+[priority]` for any service it exposes (not consumed by anything in this
+repo yet — it's there for a future rewrite of `percorso-net`, which lives in
+the `percorso-perception` repo).
 
 For the DAAAM workflow, launch `daaam-cosmos`, then run `bjob connect <jobid>` from IDE terminals and choose `cosmos`, `daaam`, `shell`, or `gpu`. The `daaam` option opens a prepared container shell with ROS sourced, `PYTHONPATH`, `HOI_FPS`, and `COSMOS_URL` set. Set `BATCH_NAME` manually inside that shell.
