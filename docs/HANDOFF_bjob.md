@@ -6,6 +6,55 @@
 
 ---
 
+## Update — 2026-08-21: risks #1 and #2 resolved
+
+Both top-ranked risks below have since been fixed. The rest of this document is
+left as-is (real history, still useful context) with inline notes where it's
+now stale.
+
+- **Risk #1 (cursor-arithmetic redraw, §3, §6.1)** — fixed via §8's Option A.
+  `_main_screen` and `select_profile` now do a full `\033[H\033[2J` + reprint
+  on every key press instead of `tput cuu`/`cud` row counting. No more
+  `redrawn` variable, no more per-branch cursor restoration to get wrong.
+- **Risk #2 (`daaam-cosmos` colonizing the tool, §6.2)** — fixed by extracting
+  it, not by deleting it (the paper-reproduction constraint in §7 still
+  applies; nothing about its behavior changed). `bin/bjob` now loses ~180
+  lines and every `"$jobname" == "daaam-cosmos"` check.
+
+**The mechanism:** an optional `jobs/<name>/bjob_hooks.sh`, sourced on demand
+— the same pattern this tool already used for `setup.sh`, extended to let a
+profile customize `bjob`'s own behavior instead of just the shell environment.
+`load_hooks <name>` sources it and `unset -f`s the hook functions first, so
+switching between profiles within one TUI session can't leak stale hooks from
+whatever was active before.
+
+| Hook | Called from | Contract |
+|---|---|---|
+| `hook_pick_role` | `connect_job` | stdout = chosen role name; return 1 = cancel |
+| `hook_role_script <role>` | `connect_job` | stdout = script path, relative to the profile dir |
+| `hook_role_env <role>` | `connect_job` | stdout = extra `NAME=value` lines (one per line) for the role's `srun` env |
+| `hook_role_help` | `print_ide_commands` | extra help lines for a running job of this profile |
+| `hook_launch <name>` | `handle_new_job` | replaces `launch_profile` entirely when defined |
+| `hook_extra_log_globs` | `log_paths` | stdout = extra log paths/patterns to show |
+
+All are optional — `bjob` checks `declare -f hook_x` before calling any of
+them, so a profile with no `bjob_hooks.sh` behaves exactly like before this
+change. `jobs/daaam-cosmos/bjob_hooks.sh` defines all six (it owns the
+role picker, the afk sbatch launch flow, and the batch-range prompt, moved
+here verbatim); `jobs/cosmos-reason2/bjob_hooks.sh` defines only
+`hook_extra_log_globs` (three lines).
+
+One behavior-preserving wrinkle: `hook_role_env` and `hook_launch` run inside
+a `bin/bjob` shell that only sees their **stdout**, not their side effects —
+a hook that needs to hand data back (e.g. the batch range it just prompted
+for) must print it as `NAME=value` lines and let the caller parse those back
+out, rather than relying on a global variable set inside the hook leaking
+into `bin/bjob`'s scope. (It doesn't, because `"$(hook_role_env ...)"` runs in
+a subshell.) See `connect_job`'s `_bstart`/`_bend` extraction from `role_env`
+for the pattern if adding a hook that needs to do the same.
+
+---
+
 ## 1. What it is for
 
 A SLURM front-end for one user on Berzelius. Two halves:
@@ -44,7 +93,7 @@ is not a new idea here — it is already in the file and has never caused a prob
 
 ---
 
-## 3. How the display works, and why it is fragile
+## 3. How the display worked, and why it was fragile (resolved — see update above)
 
 `main` enters the **alternate screen** (`\033[?1049h`), hides the cursor, and loops
 `_main_screen`. `_main_screen` clears once (`\033[H\033[2J`), prints a static header,
@@ -121,11 +170,11 @@ real damage. **Re-run `toolbox-doctor lint` after every edit** (contract in
 
 ## 6. Cons — ranked by risk
 
-1. **Cursor-arithmetic redraw** (§3). The most likely source of future "display is
-   garbled" reports, and the hardest to reproduce.
-2. **205 lines for `daaam-cosmos`** — role picker, launch-mode picker, auto-batch range,
+1. ~~**Cursor-arithmetic redraw** (§3).~~ **Resolved 2026-08-21** — see the update at the top.
+2. ~~**205 lines for `daaam-cosmos`**~~ — role picker, launch-mode picker, auto-batch range,
    state dir, plus 12 name-equality checks scattered through `connect_job`,
-   `print_ide_commands` and `log_paths`. One profile has colonised the general tool.
+   `print_ide_commands` and `log_paths`. **Resolved 2026-08-21** — extracted into
+   `jobs/daaam-cosmos/bjob_hooks.sh`, see the update at the top.
 3. **Global mutable render state** (`_SEL`, `_NJOBS`, `_JIDS[]`, `_SP_*`, `_RESULT`) —
    functions communicate by side effect, so nothing is testable in isolation.
 4. **`save_profile` rewrites `config.sh` from a fixed template.** Any field not in that
@@ -156,7 +205,7 @@ real damage. **Re-run `toolbox-doctor lint` after every edit** (contract in
 
 ---
 
-## 8. The interactive-style question
+## 8. The interactive-style question (Option A done — see update above)
 
 Three options, in increasing order of change:
 
