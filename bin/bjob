@@ -162,16 +162,19 @@ profile_line() {
     local name="$1" width="${2:-72}"
     (
         source "$JOBS_DIR/$name/config.sh" 2>/dev/null || true
-        local gpu=""
-        [[ "${D_PARTITION:-}" != "cpu" && "${D_PARTITION:-}" != "berzelius-cpu" ]] && gpu="${D_GPUS:-1}G"
-        local setup=""
-        [[ -f "$JOBS_DIR/$name/setup.sh" ]] && setup=" setup"
-        [[ -n "${D_RESERVATION:-}" ]] && setup="$setup res:$D_RESERVATION"
+        # Partition and account are omitted here on purpose: for this user they
+        # are almost always the same single value across every profile, so
+        # showing them per row is noise, not information.
+        local size="${D_MEM:-?}"
+        [[ "${D_PARTITION:-}" != "cpu" && "${D_PARTITION:-}" != "berzelius-cpu" ]] && size="${D_GPUS:-1}x${size}"
+        local flags=""
+        [[ -f "$JOBS_DIR/$name/setup.sh" ]] && flags="setup"
+        [[ -n "${D_RESERVATION:-}" ]] && flags="${flags:+$flags }res:$D_RESERVATION"
         local line
-        if (( width < 58 )); then
-            line="${name} ${D_PARTITION:-?} ${gpu} ${D_TIME:-?} ${D_MEM:-?}${setup}"
+        if (( width < 42 )); then
+            line="${name} ${D_TIME:-?} ${size} ${flags}"
         else
-            line=$(printf "%-14s %-12s %-3s %-9s %-6s %s%s"                 "$name" "${D_PARTITION:-?}" "$gpu" "${D_TIME:-?}" "${D_MEM:-?}"                 "${D_ACCOUNT:-?}" "$setup")
+            line=$(printf "%-22s %-9s %-7s %s"                 "$name" "${D_TIME:-?}" "$size" "$flags")
         fi
         trunc_pad "$line" "$width"
     )
@@ -255,12 +258,20 @@ _draw() {
 
 # ── Profile selector draw (top-level — reads _SP_* globals) ──────────────────
 _sp_draw() {
-    local i cols item_w hint_w hint
+    local i cols item_w hint_w hint header
     cols=$(term_cols)
     item_w=$(( cols - 8 ))
     (( item_w < 24 )) && item_w=24
     hint_w=$(( cols - 4 ))
     (( hint_w < 20 )) && hint_w=20
+
+    if (( item_w < 42 )); then
+        header='NAME TIME GPUxMEM'
+    else
+        header=$(printf "%-22s %-9s %-7s %s" \
+            "NAME" "TIME" "GPUxMEM" "FLAGS")
+    fi
+    printf "      ${BOLD}${C}%s${NC}\n" "$(trunc_pad "$header" "$item_w")"
 
     for ((i = 0; i < _SP_N; i++)); do
         if [[ $i -eq $_SP_SEL ]]; then
@@ -282,9 +293,9 @@ _sp_draw() {
 
     if [[ $_SP_SEL -lt $_SP_N ]]; then
         if (( cols < 72 )); then
-            hint='up/down enter launch e edit d del q back'
+            hint='up/down enter launch e path d del q back'
         else
-            hint='up/down navigate  [Enter] launch  [d] delete  [e] edit setup.sh  [q] back'
+            hint='up/down navigate  [Enter] launch  [d] delete  [e] setup.sh path  [q] back'
         fi
     else
         if (( cols < 72 )); then
@@ -762,7 +773,9 @@ handle_new_job() {
                     read -rp "  No setup.sh for '$pname'. Create one? [Y/n]: " yn
                     [[ ! "$yn" =~ ^[Nn]$ ]] && wizard_profile "$pname"
                 else
-                    ${EDITOR:-nano} "$setup"
+                    printf "\n${C}  %s${NC}\n" "$setup"
+                    printf "\n  ${DIM}Ctrl/Cmd-click the path above to open it, or press any key to continue...${NC}"
+                    IFS= read -rsn1 2>/dev/null || true
                 fi ;;
             *)
                 load_hooks "$_RESULT"
