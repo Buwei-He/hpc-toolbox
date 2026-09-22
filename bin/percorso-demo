@@ -9,26 +9,29 @@
 # else (bridge, rolling buffer, mid-run event refresh, remote query) is the real
 # demo path. Run this INSIDE a SLURM job on a compute node.
 #
-#   percorso-demo where              print the paths this tool uses
-#   percorso-demo overlay            one-time: build the demo ROS overlay
-#   percorso-demo doctor             verify the demo code is what will actually run
-#   percorso-demo status             what is running on THIS node, and is it healthy
-#   percorso-demo zenoh              start the ROS-topic bridge (background)
-#   percorso-demo pipeline [label]   start perception + bridge (foreground)
-#   percorso-demo bag [batch]        play the rosbag LOCALLY
-#   percorso-demo logs <svc> [-f]    tail a background service's log
-#   percorso-demo stop <svc|all>     stop background services
+#   percorso-demo doctor              verify the demo code is what will actually run
+#   percorso-demo run bag [batch] [--snapshot[=N]]  mock test, one command
+#   percorso-demo run live [--snapshot[=N]]         real demo, one command
+#     --snapshot[=N]: also poll the query bridge every N sec (default 30) and
+#     write dsg.json/events.yaml snapshots — see tools/snapshot_poller.py.
+#   percorso-demo status              what is running on THIS node, and is it healthy
+#   percorso-demo where               print the paths this tool uses
+#   percorso-demo overlay             one-time: build the demo ROS overlay
+#   percorso-demo logs <svc> [-f]     tail a background service's log
+#   percorso-demo stop <svc|all>      stop background services
 #
-# Two ways to feed the pipeline:
-#   'bag'   — bag plays here on the server. Tests the query path only.
-#   'zenoh' — the robot runs ros2 bag play (or a real camera) and a zenoh bridge
-#             in client mode; topics arrive as real ROS topics. This is the
-#             supported transport. ('ingest' is the retired custom version.)
+# 'run' is the entry point — it picks the params for each mode so nothing has to
+# be re-typed. Two ways it can feed the pipeline:
+#   'bag'    — bag plays here on the server. Tests the query path only.
+#   'stream' — the robot/laptop dials OUT through an ssh-helper tunnel and pushes
+#              raw TCP; this side only listens. No zenoh, no ros1_bridge.
+#              (tools/stream/receiver + tools/stream/sender.)
+# 'stream'/'pipeline'/'bag' still exist directly, for manual control.
 #
 # Why background services: the documented workflow is ONE tmux window inside ONE
 # Apptainer shell inside ONE SLURM job. A second terminal means a second ssh hop
 # and re-attaching to a private compute node — so anything that is a daemon
-# rather than something you watch (zenoh) detaches by default and leaves a
+# rather than something you watch (stream) detaches by default and leaves a
 # pidfile + log behind. Add --fg to watch it instead; add --bg to detach the
 # things that normally run in the foreground.
 #
@@ -55,13 +58,27 @@ DEMO_LIB="${PERCORSO_DEMO_LIB:-/ros2_ws/src/percorso-perception/src}"
 DEMO_ROS="${PERCORSO_DEMO_ROS:-$PROJECT/ros2_ws/src/percorso-perception-ros}"
 BATCH="${PERCORSO_BATCH:-batch_7}"          # smallest EGG bag — fastest first test
 BRIDGE_PORT="${PERCORSO_BRIDGE_PORT:-8100}"
-ZENOH_PORT="${PERCORSO_ZENOH_PORT:-7447}"
-ZENOH_BIN="${PERCORSO_ZENOH_BIN:-$PROJECT/zenoh/zenoh-bridge-ros2dds}"
+STREAM_PORT="${PERCORSO_STREAM_PORT:-9001}"   # tools/stream/receiver — current transport
+STREAM_RECEIVER="${PERCORSO_STREAM_RECEIVER:-$PROJECT/ros2_ws/src/percorso-perception/tools/stream/receiver/ros2_stream_receiver.py}"
+# Unset by default: the egg launch file's own odom_frame/sensor_frame defaults
+# match the EGG dataset's recorded tf, which is what 'bag' plays. The live
+# Odin1 feed needs different names (odin1_odom / odin1_camera_0 — see the
+# STATUS note atop tools/stream/receiver/ros2_stream_receiver.py for why they
+# carry an odin1_ prefix) — set these two only when running against 'stream'.
+ODOM_FRAME="${PERCORSO_ODOM_FRAME:-}"
+SENSOR_FRAME="${PERCORSO_SENSOR_FRAME:-}"
+RGB_TOPIC="${PERCORSO_RGB_TOPIC:-/cam0/rgb_image}"
+DEPTH_TOPIC="${PERCORSO_DEPTH_TOPIC:-/cam0/depth_image}"
 
 # Runtime state is PER NODE on purpose: compute nodes are ephemeral, so a pidfile
 # from yesterday's node describes a process that cannot exist. Under $PROJECT so
 # it is visible from both inside and outside the container.
 RUN_DIR="${PERCORSO_RUN_DIR:-$PROJECT/.percorso/run/$(hostname -s)}"
+# DAAAM's own output convention (ROOT_DIR/output/..., src/daaam/__init__.py) —
+# a demo run's snapshots sit next to output/egg/, output/hoi4d/, etc., not off
+# in the toolbox's own .percorso/ state directory.
+SNAPSHOT_DIR="${PERCORSO_SNAPSHOT_DIR:-${DEMO_LIB%/src}/output/snapshot}"
+SNAPSHOT_POLLER="${PERCORSO_SNAPSHOT_POLLER:-$PROJECT/ros2_ws/src/percorso-perception/tools/snapshot_poller.py}"
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' DIM='\033[2m' NC='\033[0m'
 ok()   { printf "${G}  ok${NC}    %s\n" "$*"; }
@@ -177,7 +194,7 @@ svc_start_container() {
     svc_start "$name" "$cmd" "$(container_preamble)" "${launcher[@]}"
 }
 
-SERVICES="zenoh pipeline bag power ingest"
+SERVICES="stream pipeline bag snapshot power netcheck"
 
 # ── where ─────────────────────────────────────────────────────────────────────
 cmd_where() {
@@ -191,11 +208,10 @@ cmd_where() {
     printf "  overlay     %s\n" "$OVERLAY"
     printf "  demo lib    %s\n" "$DEMO_LIB"
     printf "  demo ros    %s\n" "$DEMO_ROS"
-    printf "  zenoh bin   %s\n" "$ZENOH_BIN"
     printf "  run dir     %s\n" "$RUN_DIR"
     printf "\n"
     note "run dir is per-node; pids/logs for services started here live in it"
-    note "the companion tool for the laptop side is percorso-net (in percorso-perception/tools)"
+    note "the companion tool for the laptop side is ssh-helper (in percorso-perception/tools)"
 }
 
 # ── overlay ───────────────────────────────────────────────────────────────────
@@ -246,31 +262,13 @@ cmd_doctor() {
         fails=$((fails+1))
     fi
 
-    # Must be tested INSIDE the container: the login node has older glibc and the
-    # binary fails there with "GLIBC_2.38 not found" even though it runs fine in
-    # the container. Gate on exit status, not on output — printing a linker error
-    # as "ok" is worse than no check at all.
-    if [ ! -x "$ZENOH_BIN" ]; then
-        warn "no zenoh bridge at $ZENOH_BIN — remote feeding unavailable"
-        note "see $PROJECT/zenoh/README.md"
-        fails=$((fails+1))
-    elif zver=$(in_container "'$ZENOH_BIN' --version" 2>/dev/null | tail -1) \
-         && printf '%s' "$zver" | grep -q "zenoh-bridge-ros2dds"; then
-        ok "zenoh bridge runs in-container ($zver)"
-    else
-        warn "zenoh bridge present but will not run inside the container"
-        note "wrong build? use the x86_64-unknown-linux-gnu-standalone asset"
-        note "the musl build needs /lib/ld-musl-x86_64.so.1, which is absent"
-        fails=$((fails+1))
-    fi
-
-    # Only needed for 'percorso-demo bag' (local replay). With zenoh feeding the
-    # bag lives on the robot, so a missing local bag is not a failure.
+    # Only needed for 'percorso-demo bag' (local replay). With the robot feeding
+    # over 'stream' the bag isn't needed, so a missing local bag is not a failure.
     local bag="$PROJECT/ros2_ws/data/EGG-Dataset/bags/egg_${BATCH}_full.bag"
     if [ -e "$bag" ]; then
         ok "local bag available for 'bag' mode ($(basename "$bag"), $(du -sh "$bag" 2>/dev/null | cut -f1))"
     else
-        note "no local bag for '$BATCH' — fine if the robot is feeding over zenoh"
+        note "no local bag for '$BATCH' — fine if the robot is feeding over 'stream'"
     fi
 
     # The decisive check: what will the demo launch actually execute?
@@ -368,7 +366,7 @@ cmd_doctor() {
         fails=$((fails+1))
     fi
 
-    # Absorbed from the retired `percorso-net check`: these are server-side facts,
+    # Server-side facts, so they belong here rather than in a client tool:
     # so they belong in the server-side tool rather than in the robot's client.
     if [ -n "${SLURM_JOB_ID:-}" ]; then
         ok "inside SLURM job $SLURM_JOB_ID"
@@ -401,7 +399,7 @@ except OSError as e: print(e); sys.exit(1)" 2>/dev/null; then
     fi
 
     printf "\n"
-    [ "$fails" -eq 0 ] && { ok "ready — percorso-demo zenoh, then percorso-demo pipeline"; return 0; }
+    [ "$fails" -eq 0 ] && { ok "ready — percorso-demo stream, then percorso-demo pipeline"; return 0; }
     die "$fails check(s) failed — fix the warnings above first"
 }
 
@@ -417,10 +415,10 @@ cmd_status() {
         fi
     done
     printf "\n"
-    if tcp_open "$ZENOH_PORT"; then
-        ok "zenoh port $ZENOH_PORT is accepting connections"
+    if tcp_open "$STREAM_PORT"; then
+        ok "stream receiver port $STREAM_PORT is accepting connections"
     else
-        note "nothing on zenoh port $ZENOH_PORT — start it:  percorso-demo zenoh"
+        note "nothing on stream port $STREAM_PORT — start it:  percorso-demo stream"
     fi
     if curl -sf -m 3 -o /dev/null "http://127.0.0.1:$BRIDGE_PORT/status" 2>/dev/null; then
         ok "live query bridge answering on $BRIDGE_PORT"
@@ -436,7 +434,7 @@ cmd_status() {
     fi
     printf "\n"
     note "logs:  percorso-demo logs <svc> [-f]      dir: $RUN_DIR"
-    note "from the laptop:  percorso-net connect zenoh && percorso-net connect bridge"
+    note "from the laptop:  ssh-helper connect <node> stream && ssh-helper connect <node> bridge"
 }
 
 # ── logs / stop ───────────────────────────────────────────────────────────────
@@ -467,7 +465,7 @@ cmd_stop() {
 
 # ── pipeline ──────────────────────────────────────────────────────────────────
 cmd_pipeline() {
-    # A LABEL, not a batch: with zenoh feeding, the bag is on the robot and the
+    # A LABEL, not a batch: with 'stream' feeding, the bag is on the robot and the
     # server has no bag at all. It only names the output directory. ('scene' is
     # declared but never used by the egg launch file, so it is not passed.)
     local label="live" bg=""
@@ -487,8 +485,8 @@ cmd_pipeline() {
     printf "percorso-demo pipeline — run '%s' on %s\n" "$label" "$(hostname -s)"
     note "cosmos:  $cu"
     note "bridge:  http://$(hostname -s):$BRIDGE_PORT"
-    note "frames: percorso-demo zenoh (remote robot) or percorso-demo bag (local)"
-    note "from your laptop:  percorso-net connect bridge"
+    note "frames: percorso-demo stream (remote robot), or bag (local)"
+    note "from your laptop:  ssh-helper connect <node> bridge"
     printf "\n"
 
     # exit_after_clock=false on purpose: when the bag ends we want the node ALIVE
@@ -515,6 +513,11 @@ cmd_pipeline() {
           enable_live_event_refresh:=true \
           event_refresh_interval_sec:=120.0 \
           output_run_prefix:=demo_${label}_"
+    [ -n "$ODOM_FRAME" ]   && cmd="$cmd odom_frame:='$ODOM_FRAME'"
+    [ -n "$SENSOR_FRAME" ] && cmd="$cmd sensor_frame:='$SENSOR_FRAME'"
+    if [ -n "$ODOM_FRAME$SENSOR_FRAME" ]; then
+        note "frame override: odom_frame=${ODOM_FRAME:-<launch default>} sensor_frame=${SENSOR_FRAME:-<launch default>}"
+    fi
 
     if [ -z "$bg" ]; then
         in_container "$cmd"
@@ -560,46 +563,278 @@ cmd_bag() {
     in_container "$cmd"
 }
 
-# ── zenoh (remote feeding, the supported transport) ───────────────────────────
-cmd_zenoh() {
+# ── run (one command — the params for each mode are picked for you) ───────────
+# 'bag'  — mock test, no robot: starts the pipeline in the background against
+#          dataset-shaped defaults, waits for it to be ready, then plays the
+#          batch HERE (foreground). Ctrl-C or a finished bag leaves the
+#          pipeline running and queryable — 'percorso-demo stop pipeline' when done.
+# 'live' — real demo: starts the stream receiver, points the pipeline at
+#          Odin1's own tf frames (override with PERCORSO_ODOM_FRAME /
+#          PERCORSO_SENSOR_FRAME if that's ever wrong), runs the pipeline in
+#          the foreground.
+# Replaces remembering odom/sensor frame vars and the doctor->stream->pipeline
+# or doctor->pipeline--bg->bag command order by hand; 'pipeline'/'bag'/'stream'
+# below still exist for manual control (debugging, a non-default batch mid-run,
+# scripting).
+cmd_run() {
+    local usage="run takes: bag [batch] [--loop] [--snapshot[=N]] | live [--bg] [--snapshot[=N]]"
+    local mode="${1:?$usage}"; shift
+    local batch="$BATCH" loop="" bg="" snapshot_interval=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --snapshot)   snapshot_interval=30 ;;
+            --snapshot=*) snapshot_interval="${1#--snapshot=}" ;;
+            --loop)       loop="--loop" ;;
+            --bg)         bg=1 ;;
+            -*)           die "unknown option '$1'" "$usage" ;;
+            *)            batch="$1" ;;
+        esac
+        shift
+    done
+
+    case "$mode" in
+        bag)
+            note "run bag — mock test against '$batch', no robot needed"
+            cmd_pipeline "$batch" --bg || return 1
+            if [ -n "$snapshot_interval" ]; then
+                cmd_snapshot --interval "$snapshot_interval" --out "$SNAPSHOT_DIR/$batch" || return 1
+            fi
+            cmd_bag "$batch" $loop
+            ;;
+        live)
+            note "run live — real robot feed"
+            cmd_stream || return 1
+            ODOM_FRAME="${PERCORSO_ODOM_FRAME:-odin1_odom}"
+            SENSOR_FRAME="${PERCORSO_SENSOR_FRAME:-odin1_camera_0}"
+            note "frames: odom=$ODOM_FRAME sensor=$SENSOR_FRAME"
+            note "(override with PERCORSO_ODOM_FRAME / PERCORSO_SENSOR_FRAME if ARI's own frames differ)"
+            if [ -n "$snapshot_interval" ]; then
+                # Started before the bridge is confirmed up on purpose: a
+                # foreground pipeline blocks this shell, so there is no "after
+                # it's ready" moment to hook. The poller's own retry loop
+                # already tolerates a bridge that isn't answering yet.
+                cmd_snapshot --interval "$snapshot_interval" || return 1
+            fi
+            if [ -n "$bg" ]; then cmd_pipeline --bg; else cmd_pipeline; fi
+            ;;
+        *) die "unknown mode '$mode'" "$usage" ;;
+    esac
+}
+
+# ── stream (raw TCP push over an ssh-helper tunnel — current transport) ───────
+# The receiver half of tools/stream/receiver + tools/stream/sender.
+# Compute nodes take no inbound connections, so this side only LISTENS — the
+# robot/laptop dials out through an ssh-helper tunnel. No zenoh, no ros1_bridge:
+# ROS1 messages are decoded by hand (see the receiver's own docstring) and
+# republished as native ROS2 topics — $RGB_TOPIC, $DEPTH_TOPIC, their
+# camera_info, plus /tf, /tf_static, /clock.
+cmd_stream() {
     local fg=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --fg) fg=1 ;;
             --bg) fg="" ;;
-            *)    die "unknown option '$1'" "zenoh takes [--fg]" ;;
+            *)    die "unknown option '$1'" "stream takes [--fg]" ;;
         esac
         shift
     done
     require_job
-    [ -x "$ZENOH_BIN" ] || die "no zenoh bridge at $ZENOH_BIN" \
-        "download the x86_64-unknown-linux-gnu-standalone asset from" \
-        "https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases" \
-        "(the musl build will not run here — it wants /lib/ld-musl-x86_64.so.1)"
+    [ -f "$STREAM_RECEIVER" ] || die "no receiver at $STREAM_RECEIVER"
 
-    # 'router' is positional (a -m flag is rejected) and is the side that LISTENS;
-    # the robot runs 'client', which is connect-only. Multicast scouting off: it
-    # cannot cross the tunnel and only adds discovery noise.
-    local cmd="'$ZENOH_BIN' router -l tcp/0.0.0.0:$ZENOH_PORT --no-multicast-scouting"
+    local cmd="python3 '$STREAM_RECEIVER' --port $STREAM_PORT"
 
-    printf "percorso-demo zenoh — router on %s:%s\n" "$(hostname -s)" "$ZENOH_PORT"
-    note "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}; the robot must use a DIFFERENT domain"
+    printf "percorso-demo stream — receiver on %s:%s\n" "$(hostname -s)" "$STREAM_PORT"
+    note "on the robot/laptop: ssh-helper connect $(hostname -s) stream"
+    note "                     python3 tools/stream/sender/ros1_stream_sender.py --receiver-port $STREAM_PORT"
     printf "\n"
 
     if [ -n "$fg" ]; then
-        note "foreground: this terminal is now the router's; Ctrl-C stops it"
+        note "foreground: this terminal is now the receiver's; Ctrl-C stops it"
         in_container "$cmd"
         return
     fi
 
-    svc_start_container zenoh "$cmd" || return 1
-    svc_wait_port zenoh "$ZENOH_PORT" 15 || return 1
-    ok "router listening on $(hostname -s):$ZENOH_PORT — this terminal is free"
+    svc_start_container stream "$cmd" || return 1
+    svc_wait_port stream "$STREAM_PORT" 15 || return 1
+    ok "receiver listening on $(hostname -s):$STREAM_PORT — this terminal is free"
     printf "\n"
-    note "next, here:      percorso-demo pipeline"
-    note "on the robot:    percorso-net connect zenoh"
-    note "                 zenoh-bridge-ros2dds client -e tcp/127.0.0.1:$ZENOH_PORT --no-multicast-scouting"
-    note "watch / stop:    percorso-demo logs zenoh -f  ·  percorso-demo stop zenoh"
+    note "next, here:      PERCORSO_ODOM_FRAME=odin1_odom PERCORSO_SENSOR_FRAME=odin1_camera_0 percorso-demo pipeline"
+    note "(the frame vars matter: Odin1's own tf tree is unrelated to ARI's, see"
+    note " tools/stream/receiver/ros2_stream_receiver.py's docstring)"
+    note "watch / stop:    percorso-demo logs stream -f  ·  percorso-demo stop stream"
+}
+
+# ── snapshot (periodic on-disk capture of the live query bridge) ──────────────
+# tools/snapshot_poller.py polling /dsg /events /interactions /status; writes
+# DAAAM's own dsg.json/events.yaml formats so scripts/export_rerun_output.py
+# visualizes any snapshot directory unmodified. Usually started for you by
+# 'run bag|live --snapshot[=N]', not called directly.
+cmd_snapshot() {
+    local interval=30 out="$SNAPSHOT_DIR/live" fg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --interval) interval="${2:?--interval needs seconds}"; shift ;;
+            --out)      out="${2:?--out needs a path}"; shift ;;
+            --fg)       fg=1 ;;
+            --bg)       fg="" ;;
+            *) die "unknown option '$1'" "snapshot [--interval N] [--out DIR] [--fg]" ;;
+        esac
+        shift
+    done
+    require_job
+    [ -f "$SNAPSHOT_POLLER" ] || die "no poller at $SNAPSHOT_POLLER"
+
+    local cmd="python3 '$SNAPSHOT_POLLER' --base-url http://127.0.0.1:$BRIDGE_PORT --interval $interval --out '$out'"
+
+    printf "percorso-demo snapshot — every %ss -> %s\n" "$interval" "$out"
+
+    if [ -n "$fg" ]; then in_container "$cmd"; return; fi
+    # Nothing to probe: a poller opens no port. Report the pid and move on —
+    # its own retry loop handles a bridge that isn't answering yet.
+    svc_start_container snapshot "$cmd" || return 1
+    ok "snapshot poller running — 'percorso-demo logs snapshot -f' to watch"
+}
+
+# ── netcheck (is the link fast enough to bother building the rest?) ───────────
+# The whole remote-feed design rests on one unmeasured number: how much uplink
+# the robot actually gets to a compute node through the ssh tunnel. Everything
+# else is decided — 4.05 Mbit/s for 640x480 rgb + native 240x160 depth, measured
+# on real frames. So this is a go/no-go, not a curiosity.
+#
+# iperf3 is NOT in the container (only on the host), so unlike every other
+# service here this one runs outside it.
+#
+# Interpreting the result:
+#   >= 10 Mbit/s  comfortable: the 640x480 plan fits with headroom for jitter
+#    4 - 10       tight but workable; drop to q70 and/or 2.5 Hz on both streams
+#   <  4          the tunnel is not the transport. Fall back to a campus-hosted
+#                 server — and note that a reachable campus box also removes the
+#                 tunnel entirely, because compute nodes have OUTBOUND access
+#                 and can dial out to it instead.
+NETCHECK_PORT="${PERCORSO_NETCHECK_PORT:-5201}"
+
+# iperf3 is on the cluster HOSTS but not in the container image, and the
+# documented workflow puts you inside the container (bjob -> apptainer shell)
+# with no way back out — there is no apptainer binary in there to nest with. So
+# the container case needs a listener that depends on nothing but python3, which
+# is what this is. The laptop pushes with nc or dd; no matching tool required.
+netcheck_sink_py() {
+    cat <<'SINKPY'
+import socket, sys, time
+
+port = int(sys.argv[1])
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", port))
+srv.listen(1)
+print("sink listening on 0.0.0.0:%d — waiting for a push" % port, flush=True)
+
+while True:
+    conn, addr = srv.accept()
+    print("connection from %s" % addr[0], flush=True)
+    total = 0
+    t0 = last = time.monotonic()
+    last_total = 0
+    try:
+        while True:
+            buf = conn.recv(1 << 20)
+            if not buf:
+                break
+            total += len(buf)
+            now = time.monotonic()
+            if now - last >= 1.0:
+                print("  %8.2f Mbit/s   (%8.1f MB so far)"
+                      % ((total - last_total) * 8 / (now - last) / 1e6, total / 1e6),
+                      flush=True)
+                last, last_total = now, total
+    except Exception as exc:
+        print("  connection error: %s" % exc, flush=True)
+    finally:
+        conn.close()
+    dt = time.monotonic() - t0
+    if dt > 0 and total > 0:
+        print("DONE  %.1f MB in %.1fs  =  %.2f Mbit/s mean"
+              % (total / 1e6, dt, total * 8 / dt / 1e6), flush=True)
+    print("still listening — run it again for a second sample", flush=True)
+SINKPY
+}
+
+cmd_netcheck() {
+    local port="$NETCHECK_PORT"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port) port="${2:?--port needs a number}"; shift ;;
+            -*) die "unknown option '$1'" "netcheck [--port N]" ;;
+            *)  die "unexpected argument '$1'" "netcheck [--port N]" ;;
+        esac
+        shift
+    done
+    require_job
+
+    # Initialised, not just declared: `local mode` leaves it UNSET, and under
+    # set -u the container path (no override, no iperf3) reads it before either
+    # branch assigns it — an unbound-variable abort exactly where this is meant
+    # to run.
+    local node cmd="" mode=""
+    node=$(hostname -s)
+    # PERCORSO_NETCHECK_MODE=sink forces the python listener even where iperf3
+    # exists — useful when the laptop has no iperf3 to drive it with.
+    if [ "${PERCORSO_NETCHECK_MODE:-}" = sink ]; then
+        mode=sink
+    elif command -v iperf3 >/dev/null 2>&1; then
+        mode=iperf3
+        cmd="iperf3 -s -p $port"
+    fi
+    if [ "$mode" != iperf3 ]; then
+        mode=sink
+        local py="$RUN_DIR/netcheck_sink.py"
+        mkdir -p "$RUN_DIR"
+        netcheck_sink_py > "$py"
+        cmd="python3 '$py' $port"
+        if command -v iperf3 >/dev/null 2>&1; then
+            note "iperf3 is here, but PERCORSO_NETCHECK_MODE=sink asked for the sink"
+        else
+            note "no iperf3 here (it is on the cluster hosts, not in the container),"
+            note "so this uses a built-in TCP sink — python3 is all it needs"
+            note "for real iperf3 you would need a HOST shell on this node, from a login node:"
+            note "  srun --jobid=${SLURM_JOB_ID:-<id>} --overlap -n1 iperf3 -s -p $port"
+        fi
+    fi
+
+    # Empty preamble and no launcher: run the listener in whatever environment
+    # this tool was invoked from, host or container. Both work.
+    svc_start netcheck "$cmd" "" || return 1
+    svc_wait_port netcheck "$port" 10 || return 1
+    ok "listener up on $node:$port  (mode: $mode)"
+    printf "\n"
+    printf "  On the laptop — UPLINK is the number that matters (the robot sends):\n\n"
+    printf "    ssh-helper connect %s %s\n\n" \
+           "$node" "$port"
+    if [ "$mode" = iperf3 ]; then
+        printf "    iperf3 -c 127.0.0.1 -p %s -t 20          # laptop -> Berzelius\n" "$port"
+        printf "    iperf3 -c 127.0.0.1 -p %s -t 20 -R       # the other direction\n" "$port"
+    else
+        # Time-bounded, not size-bounded: a fixed 200 MB is 6 seconds on a fast
+        # link and seven minutes on a slow one, and the slow case is the one
+        # worth measuring. 20 s gives ~20 per-second samples either way.
+        printf "    timeout 20 bash -c 'dd if=/dev/zero bs=1M | nc 127.0.0.1 %s'\n\n" "$port"
+        note "no nc on the laptop? any tool that opens a TCP socket and writes"
+        note "zeros for 20 s does the job — python3 socket.create_connection()"
+        printf "\n"
+        note "the RESULT PRINTS HERE, not on the laptop:"
+        note "  percorso-demo logs netcheck -f"
+        note "uplink only — a sink cannot measure the reverse direction"
+    fi
+    printf "\n"
+    note "need >= 4.05 Mbit/s sustained for 640x480 rgb + native 240x160 depth"
+    note "10+ is comfortable; under 4 means the tunnel is not the transport"
+    printf "\n"
+    note "then compare against the same ssh path with NO forward in it:"
+    note "  dd if=/dev/zero bs=1M count=64 | ssh $USER@berzelius1.nsc.liu.se 'cat >/dev/null'"
+    note "  (dd prints the rate itself; 64 MB is ~10 s at 50 Mbit/s, ~2 min at 4)"
+    note "much faster there => the ssh -L channel is the limit, not your uplink"
+    printf "\n"
+    note "stop it when done:  percorso-demo stop netcheck"
 }
 
 # ── power (staying above NSC's efficiency floor) ───────────────────────────────
@@ -660,39 +895,14 @@ cmd_power() {
     ok "mean ${mean}W — comfortably above the floor"
 }
 
-# ── ingest (superseded by zenoh) ──────────────────────────────────────────────
-cmd_ingest() {
-    local port="${PERCORSO_INGEST_PORT:-9000}" bg=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --bg) bg=1 ;;
-            -*)   die "unknown option '$1'" ;;
-            *)    port="$1" ;;
-        esac
-        shift
-    done
-    require_job
-    printf "percorso-demo ingest — listening on %s:%s\n" "$(hostname -s)" "$port"
-    note "start this BEFORE the pipeline, so /clock and camera_info exist first"
-    note "retired: percorso-net no longer knows 'ingest' — forward it by hand with"
-    note "  ssh -O forward -L 127.0.0.1:$port:$(hostname -s):$port <user>@berzelius1.nsc.liu.se"
-    printf "\n"
-    local cmd="ros2 run percorso_perception_ros percorso_ingest_node.py --ros-args -p port:=$port"
-    if [ -n "$bg" ]; then
-        svc_start_container ingest "$cmd" && svc_wait_port ingest "$port" 60
-        return
-    fi
-    in_container "$cmd"
-}
 
 case "${1:-}" in
     where|path) shift; cmd_where    "$@" ;;
     overlay)  shift; cmd_overlay  "$@" ;;
-    zenoh)    shift; cmd_zenoh    "$@" ;;
-    ingest)   shift
-              warn "'ingest' is superseded by 'zenoh' (maintained upstream, carries all topics)"
-              note "use:  percorso-demo zenoh"
-              cmd_ingest "$@" ;;
+    run)      shift; cmd_run      "$@" ;;
+    stream)   shift; cmd_stream   "$@" ;;
+    snapshot) shift; cmd_snapshot "$@" ;;
+    netcheck) shift; cmd_netcheck "$@" ;;
     doctor)   shift; cmd_doctor   "$@" ;;
     status)   shift; cmd_status   "$@" ;;
     power)    shift; cmd_power    "$@" ;;
@@ -702,32 +912,43 @@ case "${1:-}" in
     bag)      shift; cmd_bag      "$@" ;;
     *)
         cat <<USAGE
-percorso-demo — run the live-demo pipeline against an EGG rosbag
+percorso-demo — run the live-demo pipeline: mock test (recorded bag) or real demo (robot)
 
+  percorso-demo doctor                verify the DEMO code is what will run
+  percorso-demo run bag [batch] [--loop] [--snapshot[=N]]   mock test, one command
+  percorso-demo run live [--bg] [--snapshot[=N]]            real demo, one command
+
+  percorso-demo status                what is running on this node, and is it healthy
   percorso-demo where                 print every path this tool uses
   percorso-demo overlay               one-time: build the demo ROS overlay
-  percorso-demo doctor                verify the DEMO code is what will run
-  percorso-demo status                what is running on this node, and is it healthy
   percorso-demo power [sec] [--watch] GPU draw vs NSC's efficiency floor
-
-  percorso-demo zenoh [--fg]          ROS-topic bridge for a remote robot  (background)
-  percorso-demo pipeline [label] [--bg]  perception + query bridge         (foreground)
-  percorso-demo bag [batch] [--loop] [--bg]  play the rosbag HERE          (foreground)
-
+  percorso-demo netcheck [--port N]   iperf3 server, to measure the robot's uplink
   percorso-demo logs <svc> [-f|N]     tail a background service's log
   percorso-demo stop <svc|all>        stop background services
-  percorso-demo ingest [port]         deprecated: custom HTTP ingest
+
+'run' picks the params so you don't repeat them; 'stream'/'pipeline'/'bag'/
+'snapshot' below are the pieces it calls, still here for manual control (a
+mid-run batch swap, debugging, scripting):
+
+  percorso-demo stream [--fg]                    raw TCP push receiver     (background)
+  percorso-demo pipeline [label] [--bg]          perception + query bridge (foreground)
+  percorso-demo bag [batch] [--loop] [--bg]      play the rosbag HERE      (foreground)
+  percorso-demo snapshot [--interval N] [--out DIR]  periodic dsg.json/events.yaml capture (background)
 
 Services that detach write a pid + log to $RUN_DIR
 (per node — a stale pidfile from another node cannot be mistaken for a live one).
 --fg watches a background-by-default service; --bg detaches a foreground one.
+Snapshots land under $SNAPSHOT_DIR by default; visualize one with
+scripts/export_rerun_output.py --output-dir <snapshot dir>.
 
-[label] only names the output dir (default 'live'); it is NOT a batch, because with
-zenoh the bag is on the robot. [batch] applies only to 'bag' (local replay,
-default $BATCH).
+quickest path to a mock test, one terminal:
+  bjob                                # 'percorso', plus a second job: cosmos-reason2
+  percorso-demo doctor && percorso-demo run bag batch_7 --snapshot
 
-typical remote-feed session, one terminal:
-  percorso-demo doctor && percorso-demo zenoh && percorso-demo pipeline
+quickest path to the real demo, one terminal + the robot/laptop:
+  percorso-demo doctor && percorso-demo run live --snapshot
+  (robot/laptop:  ssh-helper connect <node> stream, then
+   tools/stream/sender/ros1_stream_sender.py --receiver-port 9001)
 
 this file:  $SELF
 

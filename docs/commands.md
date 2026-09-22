@@ -116,21 +116,21 @@ python3 -m daaam.human_reason.semantic_post_processing \
   --output-name events_semantic_rerun.yaml
 
 ---
-## Reaching a job's service (percorso-net)
+## Reaching a job's service (ssh-helper)
 
-`percorso-net` is the **robot/laptop side** and ships in the percorso-perception
-repo (`tools/percorso-net`). Full docs: that repo's `tools/README.md`.
+`ssh-helper` is the **robot/laptop side** and ships in the percorso-perception
+repo (`tools/ssh-helper`). Full docs: that repo's `tools/README.md`.
 
 ```bash
 # on the robot / laptop:
 export PERCORSO_SSH_TARGET=<user>@berzelius1.nsc.liu.se
-percorso-net login
-percorso-net connect zenoh && percorso-net connect bridge
+ssh-helper login
+ssh-helper connect <node> zenoh && ssh-helper connect <node> bridge
 ```
 
 **On the cluster you do not need it** — compute nodes are directly reachable from
 a login node, so there is nothing to forward. Use `percorso-demo status` to see
-what is up and on which node; run a `percorso-net` verb here and it says so.
+what is up and on which node; run a `ssh-helper` verb here and it says so.
 
 Compute nodes are private and change every allocation, so nothing is hardcoded:
 the node comes from `squeue` over ssh, matched on exact job names.
@@ -229,8 +229,8 @@ and a non-zero exit, instead of a cheerful "started" for something already gone.
 Then from your laptop:
 
 ```bash
-percorso-net login
-percorso-net connect bridge        # returns immediately; no window to keep open
+ssh-helper login
+ssh-helper connect <node> bridge        # returns immediately; no window to keep open
 curl -s localhost:8100/status
 curl -s -X POST localhost:8100/recent_video/ask \
      -H 'Content-Type: application/json' \

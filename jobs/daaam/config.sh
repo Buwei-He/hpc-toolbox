@@ -1,4 +1,4 @@
-D_ACCOUNT="berzelius-2026-36"
+D_ACCOUNT="berzelius-2026-211"
 D_PARTITION="berzelius"
 D_GPUS="1"
 D_TIME="00:59:59"
