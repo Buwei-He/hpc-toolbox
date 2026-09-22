@@ -3,6 +3,11 @@
 Ops tooling for Berzelius (NSC/LiU). Cluster-specific glue lives here — **never**
 inside application repos like `daaam` / `percorso-perception`.
 
+**Job sitting `PENDING` and not sure why, or whether that's even a
+problem?** Read `docs/quickstart.md` first — short, covers reservations,
+`interactive`, and why `berzelius-cpu` is not a faster fallback — before
+concluding something is broken or retrying blindly.
+
 ## Cluster facts you need before running anything
 
 - **Login nodes** (`berzelius1/2.nsc.liu.se`) have public IPs and outbound internet.
@@ -13,6 +18,11 @@ inside application repos like `daaam` / `percorso-perception`.
 - Partitions: `berzelius` (78 nodes, A100) and `berzelius-cpu` (**only 8 nodes**).
   CPU allocations often queue *longer* than GPU ones — do not assume a CPU-only
   job is cheaper to schedule.
+- **GPU cards on `berzelius` are not uniform**: ~44 nodes are 40 GB ("thin"), ~33
+  are 80 GB ("fat") — same `--gpus` count, very different VRAM headroom. Request
+  a size with `--constraint=fat`/`thin`, or `D_CONSTRAINT="fat"` in a profile's
+  `config.sh` (see `daaam-cosmos`, which used to OOM on some nodes and not
+  others for exactly this reason). Costs queue time: only ~40% of nodes are fat.
 - Node assignment changes every allocation. Never hardcode a node name; ask SLURM.
 - **NSC kills jobs averaging under 90 W** (idle 52 W; rising to 100 W+). Exempt: a
   job's first hour, NSC `interactive` under 8 h, and reservations (`safe`, `devel` —
@@ -34,13 +44,13 @@ inside application repos like `daaam` / `percorso-perception`.
 |---|---|---|
 | `toolbox-doctor` | yes | lint scripts for CPU-spin hazards + find runaway processes + check disk/file quota |
 | `percorso-demo where` / `doctor` / `status` | yes | locate paths, verify the overlay, see what is running |
-| `percorso-demo zenoh` / `logs <svc>` / `stop <svc>` | yes | detaching service control — returns promptly |
-| `percorso-demo pipeline` / `bag` | **no — long-running** | run the live demo against an EGG rosbag |
+| `percorso-demo stream` / `snapshot` / `logs <svc>` / `stop <svc>` | yes | detaching service control — returns promptly |
+| `percorso-demo pipeline` / `bag` / `run bag\|live` | **no — long-running** | run the live demo (mock or real) |
 
 `percorso-demo logs <svc> -f` is the one exception: `-f` blocks forever by design.
 Agents should call it without `-f` (a line count instead).
 | `bjob <jobid> …` subcommands | yes | `connect`, `logs`, `gpu`, `power` (sample GPU power against NSC's kill floor for any job) |
-| `bjob submit <profile>` | yes — gated on `D_SUBMITTABLE` | non-interactive launch via `sbatch` (not `srun --pty`, no TTY needed); only profiles whose `config.sh` sets `D_SUBMITTABLE="1"` (a human's one-time confirmation that `setup.sh` doesn't hand off to a human, e.g. via `tmux attach`) — currently `cosmos-reason2`/`llava`/`cosmos3-nano-reasoner` |
+| `bjob submit <profile>` | yes — gated on `D_SUBMITTABLE` | non-interactive launch via `sbatch` (not `srun --pty`, no TTY needed); only profiles whose `config.sh` sets `D_SUBMITTABLE="1"` (a human's one-time confirmation that `setup.sh` doesn't hand off to a human, e.g. via `tmux attach`) — currently `cosmos-reason2`/`llava`/`cosmos3-nano-reasoner`/`percorso` |
 | `bjob extend <jobid>` | **ask first — submits a job** | one-click extend past 00:59:59: gated on a live power check, queues a dependent follow-up job (`hook_extend`); only profiles that checkpoint their own progress support it (currently daaam-cosmos's `cosmos-server`/`daaam-worker`) |
 | `bjob` (no args) | **no — needs TTY** | interactive job manager |
 

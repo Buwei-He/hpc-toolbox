@@ -201,6 +201,114 @@ job" message could print. Same one-line fix, now applied at both remaining
 call sites; confirmed `bjob connect`/`bjob cmds` against a nonexistent job
 id now print the intended message instead of silently exiting.
 
+## Update — later same day: `percorso` made submittable
+
+A different agent hit `bjob submit percorso` refusing (correctly, at the
+time) and asked a human to launch it by hand instead. Investigated whether
+that refusal could be lifted properly rather than worked around.
+
+It's more than the cosmetic `tmux attach-session` block it looked like at
+first. `jobs/percorso/setup.sh` starts a **detached** tmux session (`tmux
+new-session -d`) — the final `tmux attach-session` is only for a human's
+convenience, not load-bearing. But the session runs
+`enter_percorso_container.sh`, which enters the container and ends by
+printing "next: percorso-demo doctor && zenoh && pipeline" and handing off
+to an **interactive shell** for a human to type those three commands
+themselves — unlike `cosmos-reason2`/`llava`/`cosmos3-nano-reasoner`, whose
+`setup.sh` genuinely backgrounds the server itself. Just silencing the
+`tmux attach` would have made `bjob submit percorso` "succeed" — job
+running, no hang — while doing **nothing**: no zenoh, no pipeline, a GPU
+allocation burned on an idle interactive shell nobody's watching. Worse
+than the honest refusal it replaced.
+
+Fixed properly instead of worked around, after confirming with the user
+given the stakes (this profile faces a real robot eventually): tmux's
+`pipe-pane` already logs the pane's output regardless of whether anyone's
+attached, so running the pipeline in the foreground inside that same
+detached session works headlessly. `percorso/setup.sh` now computes
+`AUTOSTART` from `[[ -t 0 && -t 1 ]]` and threads it into the tmux session
+as `PERCORSO_AUTOSTART`; `enter_percorso_container.sh` checks it and runs
+`percorso-demo doctor && percorso-demo zenoh && exec percorso-demo
+pipeline` in place of the interactive hand-off when set, falling through
+to a clear error (not a silent hang or a silent no-op) if doctor or zenoh
+fails. The interactive path is byte-for-byte unchanged, just now reached
+via the `elif` branch instead of unconditionally — a human with a real TTY
+still gets attached exactly as before.
+
+`bjob submit`'s own `sleep infinity` (appended after `source setup.sh`,
+generic across all `D_SUBMITTABLE` profiles) already covers holding the
+allocation open here too — `setup.sh` returns quickly either way (creating
+a detached tmux session doesn't block), so no changes were needed in
+`bin/bjob` itself; `percorso` just became one more profile whose `setup.sh`
+returns after backgrounding its real work.
+
+**Real bug found and fixed along the way, unrelated to the above:**
+`enter_percorso_container.sh`'s `cosmos_hint()` had no `|| true` on its
+last line. Under `set -e`, `hint="$(cosmos_hint)"` aborted the *entire
+script* — before the container even started — whenever there was no
+running `cosmos-reason2` job to find by name *and* no cached
+`$PROJECT/.cosmos_url` (e.g., the very first time anyone starts `percorso`
+before `cosmos-reason2` has ever run). Silent and total: no error, the
+script just stopped. Same one-line fix as the other `set -e` bugs found
+this session — a missing hint isn't a failure, that function just
+shouldn't be allowed to make it look like one.
+
+Verified with stubs (`tmux`, `apptainer`, `sbatch`, `squeue`, plus manually
+reconstructing and `bash -n`-checking the inner single-quoted `bash -lc`
+payload that's opaque to a plain `bash -n` on the outer file): `AUTOSTART`
+threads correctly into the tmux session command; the attach is correctly
+skipped headless and correctly still fires when the diff shows the
+original interactive lines untouched; `bjob submit percorso` now succeeds
+and generates a correct `sbatch` script including `--reservation=safe`
+(no more "no reservation set" warning, since `D_RESERVATION` was already
+set on this profile). Not verified: an actual live run through `percorso-
+demo doctor`/`zenoh`/`pipeline` inside a real allocation — that needs a
+real GPU and a built overlay, out of reach from stubs.
+
+## Update — 2026-09-22: `D_CONSTRAINT`, requesting a specific GPU size
+
+Prompted by a genuinely dual-sided question: how do you predict a model
+server's VRAM need before starting it, and how do you stop it OOMing when
+you can't? Researched rather than guessed — checked what this repo
+already does and what the cluster actually looks like before answering.
+
+Turns out the "predict beforehand" half is largely unanswerable precisely
+(KV-cache use scales with concurrent requests × context length, not just
+the model) — but the profiles here already handle that by capping instead
+of predicting: `COSMOS_GPU_MEMORY_UTILIZATION` / `COSMOS3_GPU_MEMORY_
+UTILIZATION` / SGLang's `--mem-fraction-static` (all pre-existing, just
+not written down anywhere central before now) bound a *fraction* of the
+card's VRAM; the server refuses new requests at that ceiling instead of
+overrunning it.
+
+The other half — Berzelius' `berzelius` partition is not one uniform
+hardware pool. Checked via `sinfo -N -o "%N %G %f"`: ~44 nodes carry 40 GB
+A100s (`AVAIL_FEATURES=thin`), ~33 carry 80 GB ones (`fat`). Same
+`--gpus` count either way — double the VRAM ceiling on a fat one. SLURM
+already supports requesting a specific size (`--constraint=fat`/`thin`,
+standard SLURM feature-constraint syntax); this toolbox never used it.
+
+Added `D_CONSTRAINT` as a new profile `config.sh` key, same pattern as
+`D_RESERVATION`/`D_POWER_GUARD`/`D_SUBMITTABLE`: threaded into
+`launch_profile`'s `srun_args` and `cmd_submit`'s generated `#SBATCH`
+lines (`--constraint="$D_CONSTRAINT"`), carried through `save_profile`'s
+template so a wizard edit doesn't drop it, and surfaced directly (not
+abbreviated) in `profile_line`'s FLAGS column — `fat`/`thin` reads fine
+on its own, no `constraint:` prefix needed.
+
+Set `D_CONSTRAINT="fat"` on `daaam-cosmos` — its own `config.sh` comment
+already described "fine on an 80 GB card, OOM-prone on a 40 GB one" as an
+accepted, unfixed limitation. It no longer has to be. (Also fixed that
+comment's other claim while touching it: "bjob special-cases it in 12
+places" predates the `bjob_hooks.sh` extraction two rounds back and was
+stale.)
+
+Verified: `srun --test-only` with `--constraint=fat` resolves to a real
+node (`node090`), confirmed via `sinfo` to actually be an 80 GB `fat`
+node — not just syntactically accepted. `bash -n` + `toolbox-doctor lint`
+clean. Not verified: an actual `daaam-cosmos` run on the resulting node —
+same "needs a real allocation" limitation as the `percorso` work above.
+
 ---
 
 ## 1. What it is for

@@ -32,3 +32,9 @@ D_RESERVATION="safe"
 # A demo idles by nature — the one profile that should sample itself instead
 # of relying on someone remembering to run 'bjob power'/'percorso-demo power'.
 D_POWER_GUARD="1"
+# setup.sh no longer hangs on tmux attach-session without a TTY: it passes
+# PERCORSO_AUTOSTART into the detached session, and enter_percorso_container.sh
+# runs 'percorso-demo doctor && run live' in place of the interactive
+# shell hand-off when there's nobody there to type it. Verified safe to run
+# with 'bjob submit', nobody watching.
+D_SUBMITTABLE="1"

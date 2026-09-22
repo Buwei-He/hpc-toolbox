@@ -22,6 +22,8 @@ cosmos_hint() {
         done < <(squeue -u "$USER" -h -t RUNNING -o '%j|%N' 2>/dev/null || true)
     fi
     [[ -s "$PROJECT/.cosmos_url" ]] && tr -d '\n' < "$PROJECT/.cosmos_url"
+    return 0   # a missing hint is not a failure -- under set -e, hint="$(cosmos_hint)"
+               # would otherwise abort this whole script before the container even starts
 }
 
 printf '\npercorso demo shell on %s\n' "$NODE"
@@ -34,11 +36,11 @@ if [ -n "$hint" ]; then
 else
     printf '  cosmos    not running — start the cosmos-reason2 profile in another job\n'
 fi
-printf '\nnext:  percorso-demo doctor  &&  percorso-demo zenoh  &&  percorso-demo pipeline\n\n'
+printf '\nnext:  percorso-demo doctor  &&  percorso-demo run live\n\n'
 
 # -B $PROJECT explicitly: /proj happens to be auto-bound by the site config, but
-# the demo needs the overlay, the zenoh binary and .cosmos_url from there, so it
-# should not depend on that staying true.
+# the demo needs the overlay and .cosmos_url from there, so it should not depend
+# on that staying true.
 exec apptainer exec --nv \
     -B "$PROJECT/ros2_ws:/ros2_ws" \
     -B "$PROJECT/rosbags:/rosbags" \
@@ -53,5 +55,11 @@ exec apptainer exec --nv \
         fi
         export PYTHONPATH="'"$DEMO_LIB"'":/ros2_ws/python_packages:$PYTHONPATH
         echo "demo environment ready (percorso_perception_ros + demo daaam lib)."
+        if [ "${PERCORSO_AUTOSTART:-0}" = "1" ]; then
+            echo "PERCORSO_AUTOSTART=1 — no TTY to hand off to, starting the pipeline automatically."
+            percorso-demo doctor && exec percorso-demo run live
+            echo "ERROR: doctor or run failed (see above) — not starting the pipeline." >&2
+            exit 1
+        fi
         exec bash --norc --noprofile -i
     '

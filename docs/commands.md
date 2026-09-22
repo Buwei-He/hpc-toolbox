@@ -125,7 +125,7 @@ repo (`tools/ssh-helper`). Full docs: that repo's `tools/README.md`.
 # on the robot / laptop:
 export PERCORSO_SSH_TARGET=<user>@berzelius1.nsc.liu.se
 ssh-helper login
-ssh-helper connect <node> zenoh && ssh-helper connect <node> bridge
+ssh-helper connect <node> stream && ssh-helper connect <node> bridge
 ```
 
 **On the cluster you do not need it** — compute nodes are directly reachable from
@@ -196,23 +196,26 @@ percorso-demo where                # where this tool and everything it touches l
 percorso-demo overlay              # ONE TIME: build the percorso_perception_ros overlay
 percorso-demo doctor               # confirms DEMO code will run, not the paper code
 
-# inside a SLURM job — ONE shell is enough:
-percorso-demo zenoh                # router on :7447, detaches, returns
-percorso-demo pipeline             # perception + query bridge on :8100 (foreground)
+# inside a SLURM job — ONE shell is enough. 'run' picks the params per mode,
+# so this is the whole thing, one command each:
+percorso-demo run bag batch_7      # mock test: local bag, no robot needed
+percorso-demo run live             # real demo: robot pushes over 'stream', :9001
 
-# or feed from a local bag instead of a remote robot:
-percorso-demo pipeline --bg        # detach the pipeline instead
-percorso-demo bag batch_7          # play the bag HERE (--loop repeats)
+# 'stream'/'pipeline'/'bag' still exist individually for manual control —
+# 'run' just calls them in the right order with the right params:
+percorso-demo stream                # raw-TCP-push receiver alone, detaches, returns
+percorso-demo pipeline              # perception + query bridge on :8100 (foreground)
+percorso-demo bag batch_7           # play the bag HERE alone (--loop repeats)
 
 percorso-demo status               # what is running on this node, and is it healthy
-percorso-demo logs zenoh -f        # tail a detached service
+percorso-demo logs stream -f       # tail a detached service
 percorso-demo stop all             # stop everything this tool started here
 ```
 
 **One terminal is the design point.** The documented workflow is one tmux window
 inside one `apptainer shell` inside one SLURM job, and a second terminal costs you
 an ssh hop plus re-attaching to a private node. So anything that is a *daemon*
-rather than something you watch — `zenoh` — detaches by default, writing a pid and
+rather than something you watch — `stream`/`snapshot` — detaches by default, writing a pid and
 a log to `$PROJECT/.percorso/run/<node>/`. `--fg` watches it anyway; `--bg`
 detaches `pipeline`/`bag`, which are foreground by default because their output is
 the thing you actually want to read.
@@ -221,7 +224,7 @@ The run directory is **per node** on purpose: compute nodes are ephemeral, so a
 pidfile from yesterday's node describes a process that cannot exist, and treating
 it as live would be worse than having no state at all.
 
-A detached service is verified, not assumed: `zenoh` waits for the port to accept
+A detached service is verified, not assumed: `stream` waits for the port to accept
 a connection, `pipeline --bg` waits up to 180 s for `/status` (model load and
 TensorRT warmup dominate). If the process dies during startup you get the log tail
 and a non-zero exit, instead of a cheerful "started" for something already gone.
@@ -252,7 +255,8 @@ that one fails loudly: the demo node imports a module the paper lib does not hav
 `percorso-demo doctor` reports every layer regardless, so you never have to guess.
 
 `pipeline` takes an optional *label* (default `live`) that only names the output
-directory — it is not a batch, because with zenoh the bag is on the robot. All
+directory — it is not a batch, because with the live robot feed the bag is on the
+robot instead of here. All
 these commands work from inside the `apptainer shell` or outside it; the tool
 detects which, since there is no apptainer binary inside to nest with.
 

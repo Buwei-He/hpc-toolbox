@@ -170,6 +170,7 @@ D_JOBNAME="$name"
 ${D_RESERVATION:+D_RESERVATION=\"$D_RESERVATION\"}
 ${D_POWER_GUARD:+D_POWER_GUARD=\"$D_POWER_GUARD\"}
 ${D_SUBMITTABLE:+D_SUBMITTABLE=\"$D_SUBMITTABLE\"}
+${D_CONSTRAINT:+D_CONSTRAINT=\"$D_CONSTRAINT\"}
 EOF
 }
 
@@ -188,6 +189,7 @@ profile_line() {
         [[ -n "${D_RESERVATION:-}" ]] && flags="${flags:+$flags }res:$D_RESERVATION"
         [[ -n "${D_POWER_GUARD:-}" ]] && flags="${flags:+$flags }guard"
         [[ -n "${D_SUBMITTABLE:-}" ]] && flags="${flags:+$flags }submit"
+        [[ -n "${D_CONSTRAINT:-}" ]] && flags="${flags:+$flags }${D_CONSTRAINT}"
         local line
         if (( width < 42 )); then
             line="${name} ${D_TIME:-?} ${size} ${flags}"
@@ -489,9 +491,10 @@ launch_profile() {
 
     printf "\n${BOLD}${Y}  Launching: %s${NC}\n" "$name"
     if [[ -n "$gpu_flag" ]]; then
-        printf "  ${DIM}%s · %s GPU · %s · %s · account=%s%s${NC}\n" \
+        printf "  ${DIM}%s · %s GPU · %s · %s · account=%s%s%s${NC}\n" \
             "$D_PARTITION" "$D_GPUS" "$D_TIME" "$D_MEM" "$D_ACCOUNT" \
-            "${D_RESERVATION:+ · reservation=$D_RESERVATION}"
+            "${D_RESERVATION:+ · reservation=$D_RESERVATION}" \
+            "${D_CONSTRAINT:+ · constraint=$D_CONSTRAINT}"
     else
         printf "  ${DIM}%s · %s · %s · account=%s${NC}\n" \
             "$D_PARTITION" "$D_TIME" "$D_MEM" "$D_ACCOUNT"
@@ -507,6 +510,11 @@ launch_profile() {
     # reservation. A profile that legitimately idles between bursts — a live demo
     # waiting on a person — needs one of those, so a reservation is a profile field.
     [[ -n "${D_RESERVATION:-}" ]] && srun_args+=(--reservation="$D_RESERVATION")
+    # Berzelius mixes 40 GB ("thin", most nodes) and 80 GB ("fat", ~40%) A100
+    # cards — same --gpus count, very different headroom. A profile whose
+    # model only fits comfortably on one size says so here rather than
+    # OOMing on whichever card SLURM happens to hand it.
+    [[ -n "${D_CONSTRAINT:-}" ]] && srun_args+=(--constraint="$D_CONSTRAINT")
 
     printf "\n${Y}  Requesting allocation — waiting for a free node...${NC}\n"
     printf "${C}  (Ctrl-C to cancel)${NC}\n\n"
@@ -828,6 +836,7 @@ cmd_submit() {
             "$D_ACCOUNT" "$D_PARTITION" "$D_TIME" "$D_MEM" "$name"
         [[ -n "$gpu_flag" ]] && printf '#SBATCH %s\n' "$gpu_flag"
         [[ -n "${D_RESERVATION:-}" ]] && printf '#SBATCH --reservation=%s\n' "$D_RESERVATION"
+        [[ -n "${D_CONSTRAINT:-}" ]] && printf '#SBATCH --constraint=%s\n' "$D_CONSTRAINT"
         printf '#SBATCH --output=%s/%s-%%j.log\n' "$log_dir" "$name"
         printf 'cd "%s"\n[[ -f ~/.bashrc ]] && source ~/.bashrc\n' "$PROJECT"
         printf 'source "%s"\n' "$JOBS_DIR/$name/setup.sh"
