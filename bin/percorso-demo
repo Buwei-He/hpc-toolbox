@@ -67,6 +67,8 @@ R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' DIM='\033[2m' NC='\033[0m'
 ok()   { printf "${G}  ok${NC}    %s\n" "$*"; }
 warn() { printf "${Y}  warn${NC}  %s\n" "$*"; }
 note() { printf "${DIM}        %s${NC}\n" "$*"; }
+
+source "$(dirname "$SELF")/lib/power.sh"
 die()  { printf "${R}  fail${NC}  %s\n" "$1" >&2; shift || true
          for l in "$@"; do printf "${DIM}        %s${NC}\n" "$l" >&2; done; exit 1; }
 
@@ -694,9 +696,6 @@ cmd_zenoh() {
 # It reports; it does not keep you above the line. If a demo idles, the honest fixes
 # are a reservation (bjob 'percorso' profile sets one) or not holding the allocation
 # while nobody is interacting.
-POWER_FLOOR="${PERCORSO_POWER_FLOOR:-90}"     # NSC's current kill threshold, watts
-POWER_WARN="${PERCORSO_POWER_WARN:-120}"      # our own margin above the announced 100 W
-
 cmd_power() {
     local dur=60 interval=5 watch=""
     while [ $# -gt 0 ]; do
@@ -720,7 +719,7 @@ cmd_power() {
     if [ -n "$watch" ]; then
         # Detached: one line per sample into the service log, so you can leave it
         # running through a demo and read it afterwards.
-        svc_start power "$(_power_cmd "$ngpu" "$interval" watch)" || return 1
+        svc_start power "$(power_sample_cmd "$ngpu" "$interval" watch)" || return 1
         ok "power watch running (sampling every ${interval}s across $ngpu GPU(s))"
         note "read it:  percorso-demo logs power -f      stop:  percorso-demo stop power"
         return 0
@@ -730,45 +729,19 @@ cmd_power() {
            "$(hostname -s)" "$ngpu" "$dur" "$interval"
     note "NSC kills below ${POWER_FLOOR}W moving average; we warn below ${POWER_WARN}W"
     printf "\n"
-    local out; out=$(timeout "$dur" bash -c "$(_power_cmd "$ngpu" "$interval" summary)")
+    local out; out=$(timeout "$dur" bash -c "$(power_sample_cmd "$ngpu" "$interval" summary)")
     printf '%s\n' "$out"
     local mean; mean=$(printf '%s' "$out" | awk -F'mean=' 'NF>1{split($2,a," ");print a[1]}' | tail -1)
     mean="${mean%W}"
     [ -n "$mean" ] || { warn "no samples collected"; return 1; }
     if awk -v m="$mean" -v f="$POWER_FLOOR" 'BEGIN{exit !(m < f)}'; then
         warn "mean ${mean}W is BELOW NSC's ${POWER_FLOOR}W floor — this job is kill-eligible"
-        _power_advice; return 1
+        power_advice; return 1
     elif awk -v m="$mean" -v w="$POWER_WARN" 'BEGIN{exit !(m < w)}'; then
         warn "mean ${mean}W is under our ${POWER_WARN}W margin — thin, and the floor is rising"
-        _power_advice; return 1
+        power_advice; return 1
     fi
     ok "mean ${mean}W — comfortably above the floor"
-}
-
-_power_advice() {
-    note "exempt paths, in order of preference:"
-    note "  1. a reservation — bjob 'percorso' profile sets D_RESERVATION=safe"
-    note "  2. NSC's own tool, under 8h:  interactive --gpus=1 -t 04:00:00"
-    note "  3. keep jobs under one hour (what the other profiles do)"
-    note "and: do not hold the allocation while nobody is interacting"
-}
-
-# Emitted as a shell fragment so both the one-shot and the detached watcher run
-# exactly the same sampler. nvidia-smi does its own sleeping with -l, so there is
-# no polling loop of ours to get wrong.
-_power_cmd() {
-    local ngpu="$1" interval="$2" mode="$3"
-    printf '%s' "nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits -l $interval 2>/dev/null \
-      | awk -v n=$ngpu -v mode=$mode -v floor=$POWER_FLOOR '
-          { s += \$1; c++ }
-          c % n == 0 {
-              k++; tot += s; if (s > max || k == 1) max = s; if (s < min || k == 1) min = s
-              if (mode == \"watch\")
-                  printf \"sample %d  now=%.0fW  mean=%.0fW  %s\n\", k, s, tot/k, (tot/k < floor ? \"BELOW FLOOR\" : \"ok\")
-              else
-                  printf \"  sample %d  now=%.0fW  mean=%.0fW  min=%.0fW  max=%.0fW\n\", k, s, tot/k, min, max
-              fflush(); s = 0
-          }'"
 }
 
 # ── ingest (superseded by zenoh) ──────────────────────────────────────────────

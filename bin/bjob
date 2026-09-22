@@ -23,6 +23,8 @@ TOOLBOX_DIR="$(dirname "$SCRIPT_DIR")"
 JOBS_DIR="$TOOLBOX_DIR/jobs"
 PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
 
+source "$SCRIPT_DIR/lib/power.sh"
+
 mkdir -p "$JOBS_DIR"
 leave_alt_screen() {
     tput cnorm 2>/dev/null || true
@@ -107,6 +109,8 @@ Usage:
   bjob connect <jobid> [role]  Connect to a running allocation
   bjob cmds <jobid>            Print IDE-terminal commands for a job
   bjob gpu <jobid>             Show GPU power/utilization for a job
+  bjob power <jobid> [secs] [interval]
+                               Sample GPU power against NSC's kill floor
   bjob logs <jobid>            Print tmux/log file paths for a job
 
 Some profiles define extra connect roles — run 'bjob cmds <jobid>' on a
@@ -628,6 +632,45 @@ gpu_status() {
     srun --overlap --jobid "$jobid" nvidia-smi
 }
 
+# One-shot power sample against NSC's kill-floor, for any running job — no
+# need to be inside that job's shell. Uses the same sampler as
+# 'percorso-demo power' (bin/lib/power.sh), just reached via --overlap
+# instead of running on the node directly.
+power_status() {
+    local jobid="$1" dur="${2:-30}" interval="${3:-5}"
+    printf "\n${BOLD}${Y}  Power draw for job %s — %ss at %ss intervals${NC}\n\n" "$jobid" "$dur" "$interval"
+
+    local ngpu
+    ngpu=$(srun --overlap --jobid "$jobid" nvidia-smi --query-gpu=power.draw \
+             --format=csv,noheader,nounits 2>/dev/null | grep -c . || true)
+    if [[ "${ngpu:-0}" -eq 0 ]]; then
+        printf "${R}  Could not read GPUs for job %s — is it GPU-allocated?${NC}\n" "$jobid"
+        return 1
+    fi
+
+    printf "${DIM}        NSC kills below ${POWER_FLOOR}W moving average; we warn below ${POWER_WARN}W${NC}\n\n"
+    local out
+    out=$(srun --overlap --jobid "$jobid" timeout "$dur" \
+            bash -c "$(power_sample_cmd "$ngpu" "$interval" summary)" || true)
+    printf '%s\n' "$out"
+
+    local mean
+    mean=$(printf '%s' "$out" | awk -F'mean=' 'NF>1{split($2,a," ");print a[1]}' | tail -1)
+    mean="${mean%W}"
+    if [[ -z "$mean" ]]; then
+        printf "${Y}  no samples collected${NC}\n"
+        return 1
+    fi
+    if awk -v m="$mean" -v f="$POWER_FLOOR" 'BEGIN{exit !(m < f)}'; then
+        printf "${R}  mean %sW is BELOW NSC's %sW floor — job %s is kill-eligible${NC}\n" "$mean" "$POWER_FLOOR" "$jobid"
+        power_advice; return 1
+    elif awk -v m="$mean" -v w="$POWER_WARN" 'BEGIN{exit !(m < w)}'; then
+        printf "${Y}  mean %sW is under our %sW margin — thin, and the floor is rising${NC}\n" "$mean" "$POWER_WARN"
+        power_advice; return 1
+    fi
+    printf "${G}  mean %sW — comfortably above the floor${NC}\n" "$mean"
+}
+
 log_paths() {
     local jobid="$1" jobname="${2:-}"
     local project="${PROJECT:-/proj/rpl-soro/users/$USER}"
@@ -876,6 +919,9 @@ case "${1:-}" in
     gpu)
         [[ $# -ge 2 ]] || { usage; exit 2; }
         gpu_status "$2" ;;
+    power)
+        [[ $# -ge 2 ]] || { usage; exit 2; }
+        power_status "$2" "${3:-30}" "${4:-5}" ;;
     logs|log)
         [[ $# -ge 2 ]] || { usage; exit 2; }
         log_paths "$2" ;;

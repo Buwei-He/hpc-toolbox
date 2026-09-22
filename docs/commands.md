@@ -161,6 +161,11 @@ percorso-demo power --watch       # detached, one line per sample, through a dem
 percorso-demo logs power -f
 ```
 
+For any *other* job — you don't need to be inside its shell — `bjob power
+<jobid> [seconds] [interval]` samples the same way via `srun --overlap`, from
+any terminal. Both share the same sampler and floor/warn thresholds
+(`berzelius-toolbox/bin/lib/power.sh`).
+
 Measured on an idle reserved node: **52 W** — exactly NSC's stated idle level, so the
 reading is the right quantity. What a running pipeline draws is still unmeasured;
 capture it during the first full run with `--watch`.

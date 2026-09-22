@@ -66,9 +66,11 @@ A SLURM front-end for one user on Berzelius. Two halves:
 
 A **profile** is a directory `berzelius-toolbox/jobs/<name>/` holding `config.sh`
 (`D_ACCOUNT`, `D_PARTITION`, `D_GPUS`, `D_TIME`, `D_MEM`, `D_JOBNAME`, and now
-`D_RESERVATION`) and optionally `setup.sh`, which is sourced inside the allocation.
-Profiles are discovered by listing that directory — **the directory name becomes the
-SLURM job name**, not `D_JOBNAME`. Other tools depend on those names (see §7).
+`D_RESERVATION`), optionally `setup.sh` (sourced inside the allocation), and
+optionally `bjob_hooks.sh` (sourced on demand to customize `bjob`'s own
+behavior — see the update below). Profiles are discovered by listing that
+directory — **the directory name becomes the SLURM job name**, not
+`D_JOBNAME`. Other tools depend on those names (see §7).
 
 ---
 

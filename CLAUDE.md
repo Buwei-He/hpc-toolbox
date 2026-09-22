@@ -31,14 +31,15 @@ inside application repos like `daaam` / `percorso-perception`.
 
 `percorso-demo logs <svc> -f` is the one exception: `-f` blocks forever by design.
 Agents should call it without `-f` (a line count instead).
-| `bjob <jobid> …` subcommands | yes | `connect`, `logs` |
+| `bjob <jobid> …` subcommands | yes | `connect`, `logs`, `gpu`, `power` (sample GPU power against NSC's kill floor for any job) |
 | `bjob` (no args) | **no — needs TTY** | interactive job manager |
 
 **`percorso-net` lives elsewhere and is not for this side.** It is the robot/laptop
 client, shipped in the **percorso-perception** repo (`tools/percorso-net`) because
-the robot must be able to git-clone it and this toolbox is not a git repo. On the
-cluster there is nothing to forward — use `percorso-demo status` to find a service.
-A `percorso-net` verb run here refuses with that pointer.
+the robot must be able to git-clone it, and this toolbox lives only on the
+cluster's `/proj` filesystem — the robot has no path to it regardless of git. On
+the cluster there is nothing to forward — use `percorso-demo status` to find a
+service. A `percorso-net` verb run here refuses with that pointer.
 
 This toolbox is otherwise server-side only: it needs SLURM and `/proj`.
 
