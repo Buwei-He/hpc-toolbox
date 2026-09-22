@@ -40,14 +40,16 @@ inside application repos like `daaam` / `percorso-perception`.
 `percorso-demo logs <svc> -f` is the one exception: `-f` blocks forever by design.
 Agents should call it without `-f` (a line count instead).
 | `bjob <jobid> …` subcommands | yes | `connect`, `logs`, `gpu`, `power` (sample GPU power against NSC's kill floor for any job) |
+| `bjob submit <profile>` | yes — gated on `D_SUBMITTABLE` | non-interactive launch via `sbatch` (not `srun --pty`, no TTY needed); only profiles whose `config.sh` sets `D_SUBMITTABLE="1"` (a human's one-time confirmation that `setup.sh` doesn't hand off to a human, e.g. via `tmux attach`) — currently `cosmos-reason2`/`llava`/`cosmos3-nano-reasoner` |
+| `bjob extend <jobid>` | **ask first — submits a job** | one-click extend past 00:59:59: gated on a live power check, queues a dependent follow-up job (`hook_extend`); only profiles that checkpoint their own progress support it (currently daaam-cosmos's `cosmos-server`/`daaam-worker`) |
 | `bjob` (no args) | **no — needs TTY** | interactive job manager |
 
-**`percorso-net` lives elsewhere and is not for this side.** It is the robot/laptop
-client, shipped in the **percorso-perception** repo (`tools/percorso-net`) because
+**`ssh-helper` lives elsewhere and is not for this side.** It is the robot/laptop
+client, shipped in the **percorso-perception** repo (`tools/ssh-helper`) because
 the robot must be able to git-clone it, and this toolbox lives only on the
 cluster's `/proj` filesystem — the robot has no path to it regardless of git. On
 the cluster there is nothing to forward — use `percorso-demo status` to find a
-service. A `percorso-net` verb run here refuses with that pointer.
+service. A `ssh-helper` verb run here refuses with that pointer.
 
 This toolbox is otherwise server-side only: it needs SLURM and `/proj`.
 

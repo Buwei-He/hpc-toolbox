@@ -32,7 +32,7 @@ PROJECT=/proj/rpl-soro/users/$USER
 ln -sf $PROJECT/berzelius-toolbox/bin/bjob           ~/bin/bjob
 ln -sf $PROJECT/berzelius-toolbox/bin/percorso-demo  ~/bin/percorso-demo
 ln -sf $PROJECT/berzelius-toolbox/bin/toolbox-doctor ~/bin/toolbox-doctor
-# percorso-net is the robot/laptop side and lives in a different repo — see
+# ssh-helper is the robot/laptop side and lives in a different repo — see
 # ros2_ws/src/percorso-perception/tools/README.md, not this toolbox.
 ```
 
@@ -51,6 +51,11 @@ Run `bjob` from anywhere to:
 - Connect to running jobs with `srun --overlap`
 - Show GPU power/utilization, or sample power against NSC's kill floor
   (`bjob power <jobid>`) for any job — not just the one you're inside
+- Submit a profile non-interactively — `bjob submit <profile>` — for
+  scripts/agents, no TTY needed. Only profiles with `D_SUBMITTABLE="1"` in
+  `config.sh` (currently `cosmos-reason2`, `llava`, `cosmos3-nano-reasoner`);
+  everything else still needs the TUI or `bjob connect`, since their
+  `setup.sh` hands off to a human (tmux) rather than running unattended.
 
 A profile (`jobs/<name>/`) can set `D_POWER_GUARD="1"` in `config.sh` to get
 that power sampling automatically, in the background, for the job's whole
@@ -58,7 +63,7 @@ lifetime — no need to remember to check by hand. It can also carry an
 optional `bjob_hooks.sh` (custom connect roles/launch flow — see
 `docs/HANDOFF_bjob.md`) and a `ports.conf` declaring `<svc> <port>
 [priority]` for any service it exposes (not consumed by anything in this
-repo yet — it's there for a future rewrite of `percorso-net`, which lives in
+repo yet — it's there for a future rewrite of `ssh-helper`, which lives in
 the `percorso-perception` repo).
 
 For the DAAAM workflow, launch `daaam-cosmos`, then run `bjob connect <jobid>` from IDE terminals and choose `cosmos`, `daaam`, `shell`, or `gpu`. The `daaam` option opens a prepared container shell with ROS sourced, `PYTHONPATH`, `HOI_FPS`, and `COSMOS_URL` set. Set `BATCH_NAME` manually inside that shell.

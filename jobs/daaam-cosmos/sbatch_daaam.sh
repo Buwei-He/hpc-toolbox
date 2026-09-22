@@ -28,6 +28,11 @@ printf '%s\n' "$STATE_DIR" > "$PROJECT/.bjob/smart-auto-session.${SLURM_JOB_ID:-
 BATCH_START="${DAAAM_AUTO_BATCH_START:-1}"
 BATCH_END="${DAAAM_AUTO_BATCH_END:-7}"
 
+# Persist the target end once, so 'bjob extend' (a separate process, run
+# after this job has already exited) can recover it — it only has this
+# state dir to go on, not our env vars.
+[[ -f "$STATE_DIR/batch_end" ]] || printf '%s\n' "$BATCH_END" > "$STATE_DIR/batch_end"
+
 # Export so auto_ros_launch.sh and auto_bag_play.sh pick them up
 export DAAAM_AUTO_STATE_DIR="$STATE_DIR"
 export DAAAM_AUTO_BATCH_START="$BATCH_START"
@@ -58,6 +63,11 @@ _on_exit() {
     if [[ -e "$STATE_DIR/auto.done" || -e "$STATE_DIR/auto.stop" ]]; then
         return  # Completed normally or stopped on error — no resubmit
     fi
+    if [[ -e "$STATE_DIR/extended.${SLURM_JOB_ID:-manual}" ]]; then
+        return  # 'bjob extend' already queued a follow-up for THIS job id
+                # (checked power and submitted early, ahead of the time
+                # limit) — resubmitting here too would double it up.
+    fi
 
     local resume_batch="$BATCH_START"
     if [[ -f "$STATE_DIR/current_batch" ]]; then
@@ -73,7 +83,7 @@ _on_exit() {
         | tee -a "$LOG_DIR/auto_launch.log"
 
     sbatch \
-        --account="${SLURM_JOB_ACCOUNT:-berzelius-2026-36}" \
+        --account="${SLURM_JOB_ACCOUNT:-berzelius-2026-211}" \
         --partition="${SLURM_JOB_PARTITION:-berzelius}" \
         --gpus="${DAAAM_SBATCH_GPUS}" \
         --time=00:59:59 \

@@ -36,6 +36,7 @@ whatever was active before.
 | `hook_role_help` | `print_ide_commands` | extra help lines for a running job of this profile |
 | `hook_launch <name>` | `handle_new_job` | replaces `launch_profile` entirely when defined |
 | `hook_extra_log_globs` | `log_paths` | stdout = extra log paths/patterns to show |
+| `hook_extend <jobid> <jobname>` | `cmd_extend` | submits a dependent (`--dependency=afterany:<jobid>`) follow-up job that resumes this job's checkpointed progress; called directly (not `$(...)`), only after `cmd_extend` has already confirmed the job is running and its GPU power is above NSC's floor |
 
 All are optional — `bjob` checks `declare -f hook_x` before calling any of
 them, so a profile with no `bjob_hooks.sh` behaves exactly like before this
@@ -80,12 +81,125 @@ Three more additions, same session:
   with `bjob __power-guard-start` on a login node and confirm it no-ops.
 - **`jobs/<name>/ports.conf`** — new, `<svc> <port> [priority]` per line,
   added to `percorso`/`cosmos-reason2`/`daaam-cosmos`. Nothing reads these
-  yet; they exist so a future rewrite of `percorso-net` (different repo,
+  yet; they exist so a future rewrite of `ssh-helper` (different repo,
   robot/laptop side) has a correct, single-sourced service/port declaration
   to consume instead of its own hardcoded job-name map. Known gap, called
   out in `jobs/daaam-cosmos/ports.conf`: the AFK/sbatch launch mode submits
   jobs named `cosmos-server`/`daaam-worker`, which have no `jobs/<name>/`
   directory to hold a declaration.
+
+## Update — 2026-09-22: `bjob submit`, a non-interactive launch path
+
+Every verb up to this point acts on a job that already exists — nothing
+could *start* one without a TTY. `launch_profile` uses `srun --pty`
+(allocates a pty, blocks until an interactive shell exits), and the only
+thing that calls it is the TUI, which `main` refuses to run without one.
+
+Why this isn't a thin `srun --pty` wrapper with a timeout slapped on: for
+`percorso`/`daaam`, `setup.sh` itself ends by calling `tmux attach-session`
+— it would hang on the allocated pty waiting for a human who was never
+there (the same mechanism behind the power-guard-ordering bug fixed
+earlier). For `cosmos-reason2`/`llava`/`cosmos3-nano-reasoner`, `setup.sh`
+already backgrounds a server, polls until healthy, and **returns** — it
+only "hangs" today because the interactive shell around it stays open for
+someone to type into. Since which shape a given `setup.sh` has can't be
+detected reliably (grepping for `tmux attach` is exactly the kind of guess
+worth avoiding), it's a new explicit per-profile opt-in instead, same as
+`D_RESERVATION`/`D_POWER_GUARD` before it:
+
+**`D_SUBMITTABLE="1"`** in `config.sh` — the profile author's confirmation
+that `setup.sh` is safe to source with nobody watching. `bjob submit
+<profile>` refuses cleanly without it. Set on `cosmos-reason2`, `llava`,
+`cosmos3-nano-reasoner`; **not** on `percorso`/`daaam` (tmux-attach tail) or
+`daaam-cosmos` (already has its own sbatch path — `launch_afk` — but
+reaching it goes through `hook_launch` → `prompt_afk_launch_mode`, an
+interactive `read -rp` with no bypass; giving it a non-interactive entry
+point is a smaller, separate follow-up, not folded in here).
+
+`cmd_submit` builds an `sbatch` script (not `srun --pty`) from the same
+account/partition/gpu/mem/reservation values `launch_profile` already
+computes, sources `setup.sh`, optionally starts the power guard the same
+way `launch_profile`'s rc file does, then `sleep infinity` — `setup.sh`
+already backgrounded the real work and returned, so this just holds the
+allocation open for `D_TIME`. No TTY guard needed: it never reads a key or
+holds a pty, submits and returns, agent-safe by construction. Guards a
+duplicate submit (`squeue -u $USER -h -o '%j' | grep -qx name` first) and
+warns (doesn't block) when there's no `D_RESERVATION` — an unattended
+server idling for requests is exactly what NSC's floor can kill.
+
+`log_paths` picks up a submitted job's `--output` file via a plain jobid
+glob on `$PROJECT/.bjob/launch-logs/<name>-<jobid>.log` — no registration
+file needed, unlike `daaam-cosmos`'s two-job afk case, since a single
+`sbatch` job has nothing else to coordinate.
+
+**Noticed in passing, not touched:** `log_paths` (line ~887 as of this
+writing) still reads `$PROJECT/.bjob/afk-session.<jobid>`, but
+`jobs/daaam-cosmos/{bjob_hooks.sh,sbatch_*.sh}` write to
+`$PROJECT/.bjob/smart-auto-session.<jobid>` instead — a rename in flight
+from a different, concurrent session, not this round's to resolve. Whoever
+reconciles it: `log_paths` is the stale side.
+
+Tested against a stub `sbatch`/`squeue` on `PATH` (this repo's own
+documented technique, §10) rather than a real allocation for the script-
+generation and duplicate-guard logic; a real `bjob submit cosmos-reason2`
+still needs running once, live, to confirm end to end.
+
+## Update — later same day: `bjob extend` reviewed and finished
+
+`cmd_extend`/`hook_extend` (§ above, `bin/bjob`, `jobs/daaam-cosmos/
+bjob_hooks.sh`) arrived from a different, concurrent agent session that's
+since gone unreachable — reviewed here and taken over, since there's no one
+else to hand it back to.
+
+**Real bug found and fixed: double resubmission.** `sbatch_daaam.sh`'s own
+`_on_exit` trap already auto-resubmits *unconditionally* when it exits with
+batches still remaining (that's its whole purpose — see §1's worker
+description) — gated only on `auto.done`/`auto.stop` not being set. `bjob
+extend` requires the job to still be `RUNNING` (checked via `squeue`), which
+means by construction it can only ever be called *before* that trap has had
+a chance to fire. Calling `bjob extend` on a healthy, running `daaam-worker`
+job therefore queued a follow-up **and** left that job's own exit trap free
+to queue a second, independent one later when it actually timed out — both
+`--dependency=afterany:<same jobid>`, both trying to resume from the same
+`current_batch` checkpoint.
+
+Fixed with a per-job marker: `hook_extend`'s `daaam-worker` case now writes
+`$state_dir/extended.<jobid>` right after successfully queuing its
+follow-up (with the new job's id as its content, for traceability), and
+`sbatch_daaam.sh`'s `_on_exit` checks `$STATE_DIR/extended.$SLURM_JOB_ID`
+next to `auto.done`/`auto.stop` before resubmitting. It's deliberately
+keyed by job id, not a single shared flag — a follow-up job's own eventual
+timeout must still be free to auto-resubmit normally (or be extended again
+itself); only the *specific* job that was manually extended should suppress
+its own trap. Also added: `hook_extend` now refuses up front if `auto.done`
+or `auto.stop` is already set (previously it would happily queue a
+follow-up for already-finished or deliberately-stopped work) — the same
+condition `_on_exit` already checked for itself, just never applied on the
+`bjob extend` side.
+
+Known residual risk, not solved: if `bjob extend` is called in the narrow
+window while the target job is *actually* exiting (its own `_on_exit`
+already past the `extended.<jobid>` check but before `bjob extend` writes
+it), both still fire. File-based, not lock-based; acceptable for a
+personal tool, not eliminated.
+
+Verified with stubs (`scontrol`/`sbatch` on `PATH`, `_on_exit` extracted and
+run in isolation with fake `STATE_DIR`/`SLURM_JOB_ID`): the marker gets
+written after a successful queue; `auto.done`/`auto.stop` refuse cleanly;
+`_on_exit` resubmits normally with no marker, stays silent with its own
+job's marker present, and — the case worth actually checking, not assuming
+— still resubmits normally for a *different* job id even while another
+job's marker exists in the same `state_dir`.
+
+Separately, closed out a pre-existing bug flagged two rounds ago and left
+out of scope at the time: `connect_job` and `print_ide_commands` were
+calling `job_name_for_id` without the `|| true` guard `log_paths` and this
+round's `cmd_extend` already had — under `set -euo pipefail`, `squeue`
+failing for a bad job id (not a pipeline failure, an actual squeue exit
+code) aborted the whole script before the intended "could not find running
+job" message could print. Same one-line fix, now applied at both remaining
+call sites; confirmed `bjob connect`/`bjob cmds` against a nonexistent job
+id now print the intended message instead of silently exiting.
 
 ---
 
@@ -224,10 +338,12 @@ real damage. **Re-run `toolbox-doctor lint` after every edit** (contract in
 
 ## 7. Constraints from outside this file
 
-- **Job names are an API.** `percorso-net` matches job names *exactly, in priority
-  order* (`percorso`, `daaam-worker`, `daaam`, `daaam-cosmos`; `cosmos-server`,
-  `cosmos-reason2`) to locate services. Renaming a profile directory breaks discovery.
-  Substring matching was tried and resolved to the wrong node.
+- **Job names are no longer an API** (changed 2026-08-25). The client tool that
+  matched them exactly, `percorso-net`, has been removed; its replacement
+  `ssh-helper` shows the raw `squeue` listing and takes a host and port, so
+  renaming a profile directory no longer breaks anyone's discovery. One coupling
+  fewer to respect — but `percorso-demo` on the server still matches
+  `cosmos-reason2` exactly to find the Cosmos node, so that one name is load-bearing.
 - **NSC kills jobs averaging under 90 W** (idle 52 W; rising to 100 W+). Exempt: a job's
   first hour, NSC `interactive` under 8 h, and reservations. **That is why almost every
   profile is `D_TIME="00:59:59"`** — it is a deliberate dodge, not an arbitrary choice.
@@ -284,7 +400,8 @@ class. Consider **B** if display bugs recur, or as part of the post-paper cleanu
 - [ ] `save_profile` round-trip: edit a profile through the wizard and confirm **every**
       field survives, `D_RESERVATION` included.
 - [ ] Adding a profile still needs no code change (`jobs/<name>/config.sh` only).
-- [ ] Profile/job names unchanged, or `percorso-net`'s `svc_jobs()` updated to match.
+- [ ] If a profile is renamed, `cosmos-reason2` is left alone — `percorso-demo`
+      matches it exactly to locate the Cosmos node.
 - [ ] Verified without burning an allocation where possible: `srun --test-only` for
       argument construction, `sinfo`/`scontrol` for node facts, `--reservation=devel`
       for a genuinely short real run.
@@ -297,9 +414,9 @@ Most of this tool can be checked from a login node:
   combinations and prints where the job *would* start — no allocation consumed.
 - `scontrol show reservations`, `sinfo -N -o "%N %f %G"` for node facts.
 - A stub binary earlier on `PATH` (a script named `squeue` or `srun` echoing canned
-  output) exercises parsing and menu logic end-to-end. This is how `percorso-net`'s
-  job-name priority was tested; the same trick applies here and is the closest thing to
-  a unit test the tool can have. Consider committing such stubs.
+  output) exercises parsing and menu logic end-to-end. This is how the now-removed
+  `percorso-net`'s job-name priority was tested; the same trick applies here and is
+  the closest thing to a unit test the tool can have. Consider committing such stubs.
 - For a real GPU check, `--reservation=devel --time=00:02:00` starts immediately.
 
 ---
@@ -310,4 +427,4 @@ Most of this tool can be checked from a login node:
 `berzelius-toolbox/docs/commands.md` (usage + the NSC power policy) ·
 `berzelius-toolbox/bin/toolbox-doctor` (`lint`, `procs`) ·
 `berzelius-toolbox/jobs/*/` (profiles) ·
-`ros2_ws/src/percorso-perception/tools/percorso-net` (consumes job names)
+`ros2_ws/src/percorso-perception/tools/ssh-helper` (robot/laptop client)

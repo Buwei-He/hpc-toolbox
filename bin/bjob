@@ -7,7 +7,8 @@
 D_ACCOUNT=""          # e.g. "berzelius-2024-1"  (blank = auto-detect)
 D_PARTITION="berzelius"
 D_GPUS="1"
-D_TIME="06:00:00"
+D_TIME="00:59:59"     # NSC's power-floor exemption covers a job's first hour only —
+                       # see lib/power.sh. Longer needs D_RESERVATION, not a longer D_TIME.
 D_MEM="32G"
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -111,11 +112,19 @@ usage() {
     cat <<EOF
 Usage:
   bjob                         Open the interactive job manager
+  bjob submit <profile>        Submit a profile non-interactively (sbatch) —
+                               no TTY needed; only profiles with
+                               D_SUBMITTABLE="1" in config.sh support this
   bjob connect <jobid> [role]  Connect to a running allocation
   bjob cmds <jobid>            Print IDE-terminal commands for a job
   bjob gpu <jobid>             Show GPU power/utilization for a job
   bjob power <jobid> [secs] [interval]
                                Sample GPU power against NSC's kill floor
+  bjob extend <jobid> [secs] [interval]
+                               One-click extend: queue a dependent follow-up
+                               job past 00:59:59, only if GPU power is above
+                               the floor right now. Batch/service profiles
+                               with a hook_extend only (e.g. daaam-cosmos).
   bjob logs <jobid>            Print tmux/log file paths for a job
 
 Some profiles define extra connect roles — run 'bjob cmds <jobid>' on a
@@ -132,7 +141,7 @@ load_hooks() {
     local name="$1"
     [[ "$_HOOKS_LOADED_FOR" == "$name" ]] && return 0
     unset -f hook_pick_role hook_role_script hook_role_env \
-             hook_role_help hook_launch hook_extra_log_globs 2>/dev/null
+             hook_role_help hook_launch hook_extra_log_globs hook_extend 2>/dev/null
     local hooks="$JOBS_DIR/$name/bjob_hooks.sh"
     [[ -f "$hooks" ]] && source "$hooks"
     _HOOKS_LOADED_FOR="$name"
@@ -160,6 +169,7 @@ D_MEM="$D_MEM"
 D_JOBNAME="$name"
 ${D_RESERVATION:+D_RESERVATION=\"$D_RESERVATION\"}
 ${D_POWER_GUARD:+D_POWER_GUARD=\"$D_POWER_GUARD\"}
+${D_SUBMITTABLE:+D_SUBMITTABLE=\"$D_SUBMITTABLE\"}
 EOF
 }
 
@@ -177,6 +187,7 @@ profile_line() {
         [[ -f "$JOBS_DIR/$name/setup.sh" ]] && flags="setup"
         [[ -n "${D_RESERVATION:-}" ]] && flags="${flags:+$flags }res:$D_RESERVATION"
         [[ -n "${D_POWER_GUARD:-}" ]] && flags="${flags:+$flags }guard"
+        [[ -n "${D_SUBMITTABLE:-}" ]] && flags="${flags:+$flags }submit"
         local line
         if (( width < 42 )); then
             line="${name} ${D_TIME:-?} ${size} ${flags}"
@@ -506,8 +517,17 @@ launch_profile() {
         [[ -f "$setup" ]] && printf "${C}  setup.sh found — will be sourced after login.${NC}\n\n"
         local rc; rc=$(mktemp "$HOME/.bjob_rc_XXXXXX")
         printf 'cd "%s"\n[[ -f ~/.bashrc ]] && source ~/.bashrc\n' "$PROJECT" > "$rc"
-        [[ -f "$setup" ]] && printf 'source "%s"\n' "$setup" >> "$rc"
+        # The guard starts BEFORE setup.sh is sourced, not after: a `source`
+        # never returns until the sourced script does, and a profile whose
+        # setup.sh attaches to/creates a tmux session (the documented "one
+        # tmux window" workflow) blocks there for the rest of the session —
+        # a line after it would simply never run. Caught in the wild: the
+        # guard never started for tmux-based profiles because of this exact
+        # ordering. (Harmless today since the only D_POWER_GUARD profile,
+        # percorso, also sets D_RESERVATION — the guard is belt-and-suspenders
+        # there, not the only thing standing between it and NSC's kill floor.)
         [[ -n "${D_POWER_GUARD:-}" ]] && printf 'bash "%s" __power-guard-start\n' "$SCRIPT_DIR/bjob" >> "$rc"
+        [[ -f "$setup" ]] && printf 'source "%s"\n' "$setup" >> "$rc"
         srun "${srun_args[@]}" --pty bash --rcfile "$rc" || exit_code=$?
         rm -f "$rc"
     else
@@ -526,7 +546,7 @@ launch_profile() {
 # ── Connect to a running job ──────────────────────────────────────────────────
 connect_job() {
     local jobid="$1" jobname="${2:-}" role="${3:-}"
-    [[ -z "$jobname" ]] && jobname="$(job_name_for_id "$jobid")"
+    [[ -z "$jobname" ]] && jobname="$(job_name_for_id "$jobid" || true)"
 
     if [[ -z "$jobname" ]]; then
         printf "\n${R}  Could not find running job %s.${NC}\n" "$jobid"
@@ -620,7 +640,7 @@ connect_job() {
 
 print_ide_commands() {
     local jobid="$1" jobname="${2:-}"
-    [[ -z "$jobname" ]] && jobname="$(job_name_for_id "$jobid")"
+    [[ -z "$jobname" ]] && jobname="$(job_name_for_id "$jobid" || true)"
     if [[ -z "$jobname" ]]; then
         printf "\n${R}  Could not find running job %s.${NC}\n" "$jobid"
         return 1
@@ -691,6 +711,51 @@ power_status() {
     printf "${G}  mean %sW — comfortably above the floor${NC}\n" "$mean"
 }
 
+# One-click extend: queue a dependent follow-up job so work continues past
+# this job's 00:59:59, gated on this job actually being busy right now. Only
+# batch/service profiles that checkpoint their own progress can use this —
+# an interactive 'bjob' shell has no state a new job could pick back up, so
+# there is nothing meaningful to hand off. See hook_extend in HANDOFF_bjob.md.
+cmd_extend() {
+    local jobid="$1" dur="${2:-30}" interval="${3:-5}"
+
+    local state
+    state=$(squeue -u "$USER" -h -j "$jobid" --format="%T" 2>/dev/null || true)
+    if [[ "$state" != "RUNNING" ]]; then
+        printf "\n${R}  Job %s is not a running job of yours (state: %s).${NC}\n" "$jobid" "${state:-not found}"
+        exit 1
+    fi
+
+    local jobname; jobname=$(job_name_for_id "$jobid" || true)
+    if [[ -z "$jobname" ]]; then
+        printf "\n${R}  Could not resolve a job name for %s.${NC}\n" "$jobid"
+        exit 1
+    fi
+
+    # cosmos-server / daaam-worker are daaam-cosmos's own sbatch sub-jobs —
+    # their job-name isn't the profile directory name, so map it by hand
+    # rather than guessing (this is the one case, not a general lookup).
+    local profile="$jobname"
+    [[ "$jobname" == "cosmos-server" || "$jobname" == "daaam-worker" ]] && profile="daaam-cosmos"
+
+    load_hooks "$profile"
+    if ! declare -f hook_extend >/dev/null 2>&1; then
+        printf "\n${R}  '%s' has no extend support.${NC}\n" "$jobname"
+        printf "  ${DIM}Only batch/service profiles that checkpoint their own progress can be\n"
+        printf "        extended — an interactive shell has no state a new job could resume.${NC}\n"
+        exit 1
+    fi
+
+    printf "\n${BOLD}${Y}  Checking job %s (%s) is actually busy before extending...${NC}\n" "$jobid" "$jobname"
+    if ! power_status "$jobid" "$dur" "$interval"; then
+        printf "\n${R}  Not extending — see above. Extending an idle job is exactly the${NC}\n"
+        printf "${R}  padding pattern NSC already warned us about.${NC}\n"
+        exit 1
+    fi
+
+    hook_extend "$jobid" "$jobname"
+}
+
 # Runs on the COMPUTE node, re-invoked as `bjob __power-guard-start` from
 # inside the allocation's rc file (see launch_profile) — not meant to be run
 # directly. Starts a detached, logging-only sampler for the job's lifetime;
@@ -710,6 +775,80 @@ power_guard_start() {
     svc_start power-guard "$(power_sample_cmd "$ngpu" 60 watch)" ""
 }
 
+# ── Non-interactive submission, for agents ────────────────────────────────────
+# bjob submit <profile>: sbatch, not srun --pty — submits and returns, never
+# reads a key or holds a pty, so it needs no TTY guard. Deliberately narrower
+# than launch_profile: only a profile whose author has confirmed setup.sh is
+# safe to source with nobody watching (D_SUBMITTABLE="1") can be submitted
+# this way. That confirmation can't be automated — percorso/daaam's setup.sh
+# ends in `tmux attach-session`, which would hang here waiting for a human
+# who was never there, and grepping for that pattern is exactly the kind of
+# guess this flag exists to avoid. See docs/HANDOFF_bjob.md.
+cmd_submit() {
+    local name="$1"
+    load_profile "$name"
+
+    if [[ -z "${D_SUBMITTABLE:-}" ]]; then
+        printf "\n${R}  Profile '%s' is not submittable.${NC}\n" "$name"
+        printf "  ${DIM}Its setup.sh isn't confirmed safe to run with nobody watching —\n"
+        printf "        set D_SUBMITTABLE=\"1\" in its config.sh once that's verified.${NC}\n"
+        exit 1
+    fi
+
+    if [[ -z "${D_ACCOUNT:-}" ]]; then
+        local detected; detected=$(detect_accounts)
+        D_ACCOUNT=$(awk '{print $1}' <<< "$detected")
+    fi
+    if [[ -z "${D_ACCOUNT:-}" ]]; then
+        printf "\n${R}  Could not detect a SLURM account for user '%s'.${NC}\n" "$USER"
+        exit 1
+    fi
+
+    if squeue -u "$USER" -h -o '%j' 2>/dev/null | grep -qx "$name"; then
+        printf "\n${R}  A job named '%s' is already queued or running.${NC}\n" "$name"
+        printf "  ${DIM}check:  squeue -u %s${NC}\n" "$USER"
+        exit 1
+    fi
+
+    local gpu_flag=""
+    [[ "${D_PARTITION:-}" != "cpu" && "${D_PARTITION:-}" != "berzelius-cpu" ]] && gpu_flag="--gpus=${D_GPUS:-1}"
+
+    if [[ -z "${D_RESERVATION:-}" ]]; then
+        printf "\n${Y}  warn${NC}  no reservation set, and D_TIME=%s — an unattended server that\n" "$D_TIME"
+        printf "        idles waiting for requests is exactly what NSC's power floor can kill.\n"
+        printf "        Consider D_RESERVATION in %s/config.sh.\n" "$name" >&2
+    fi
+
+    local log_dir="$PROJECT/.bjob/launch-logs"
+    mkdir -p "$log_dir"
+    local sb; sb=$(mktemp "$HOME/.bjob_sbatch_XXXXXX")
+    {
+        printf '#!/bin/bash\n'
+        printf '#SBATCH --account=%s --partition=%s --time=%s --mem=%s --job-name=%s\n' \
+            "$D_ACCOUNT" "$D_PARTITION" "$D_TIME" "$D_MEM" "$name"
+        [[ -n "$gpu_flag" ]] && printf '#SBATCH %s\n' "$gpu_flag"
+        [[ -n "${D_RESERVATION:-}" ]] && printf '#SBATCH --reservation=%s\n' "$D_RESERVATION"
+        printf '#SBATCH --output=%s/%s-%%j.log\n' "$log_dir" "$name"
+        printf 'cd "%s"\n[[ -f ~/.bashrc ]] && source ~/.bashrc\n' "$PROJECT"
+        printf 'source "%s"\n' "$JOBS_DIR/$name/setup.sh"
+        [[ -n "${D_POWER_GUARD:-}" ]] && printf 'bash "%s" __power-guard-start\n' "$SCRIPT_DIR/bjob"
+        # setup.sh already backgrounded the real work and returned; this just
+        # holds the allocation open for D_TIME so that work keeps running.
+        printf 'sleep infinity\n'
+    } > "$sb"
+
+    local out jid
+    if ! out=$(sbatch "$sb" 2>&1); then
+        printf "\n${R}  sbatch failed:\n  %s${NC}\n" "$out"
+        rm -f "$sb"
+        exit 1
+    fi
+    rm -f "$sb"
+    jid=$(awk '{print $NF}' <<< "$out")
+    printf "\n${G}  Submitted job %s (%s).${NC}\n" "$jid" "$name"
+    printf "  ${DIM}watch:  bjob power %s      logs:  bjob logs %s${NC}\n" "$jid" "$jid"
+}
+
 log_paths() {
     local jobid="$1" jobname="${2:-}"
     local project="${PROJECT:-/proj/rpl-soro/users/$USER}"
@@ -727,6 +866,15 @@ log_paths() {
             found=1
         done
     fi
+
+    # bjob submit's --output path: $PROJECT/.bjob/launch-logs/<name>-<jobid>.log,
+    # jobid-keyed by sbatch's own %j, so a glob is enough — no registration
+    # file needed, unlike the multi-job afk case below.
+    for file in "$project/.bjob/launch-logs/"*"-$jobid.log"; do
+        [[ -e "$file" ]] || continue
+        printf "  %s\n" "$file"
+        found=1
+    done
 
     if [[ -d "$project/.cache/daaam-cosmos-auto" ]]; then
         for file in "$project/.cache/daaam-cosmos-auto"/"$jobid"-* "$project/.cache/daaam-cosmos-auto"/"$jobid"; do
@@ -951,6 +1099,9 @@ main() {
 }
 
 case "${1:-}" in
+    submit)
+        [[ $# -ge 2 ]] || { usage; exit 2; }
+        cmd_submit "$2" ;;
     connect)
         [[ $# -ge 2 ]] || { usage; exit 2; }
         connect_job "$2" "" "${3:-}" ;;
@@ -963,6 +1114,9 @@ case "${1:-}" in
     power)
         [[ $# -ge 2 ]] || { usage; exit 2; }
         power_status "$2" "${3:-30}" "${4:-5}" ;;
+    extend)
+        [[ $# -ge 2 ]] || { usage; exit 2; }
+        cmd_extend "$2" "${3:-30}" "${4:-5}" ;;
     logs|log)
         [[ $# -ge 2 ]] || { usage; exit 2; }
         log_paths "$2" ;;

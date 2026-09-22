@@ -20,7 +20,10 @@ power_advice() {
     printf "${DIM}        exempt paths, in order of preference:${NC}\n"
     printf "${DIM}          1. a reservation — set D_RESERVATION in the profile's config.sh${NC}\n"
     printf "${DIM}          2. NSC's own tool, under 8h:  interactive --gpus=1 -t 04:00:00${NC}\n"
-    printf "${DIM}          3. keep jobs under one hour (what most profiles do)${NC}\n"
+    printf "${DIM}          3. keep jobs under one hour (what all profiles do)${NC}\n"
+    printf "${DIM}        past one hour, batch/service profiles that checkpoint their own${NC}\n"
+    printf "${DIM}        progress can be pushed further with 'bjob extend <jobid>' — it re-runs${NC}\n"
+    printf "${DIM}        this same power check before queuing a dependent follow-up job${NC}\n"
     printf "${DIM}        and: do not hold the allocation while nobody is interacting${NC}\n"
 }
 

@@ -70,6 +70,108 @@ hook_extra_log_globs() {
     printf '%s\n' "$PROJECT/.cache/cosmos-reason2-vllm.log"
 }
 
+# hook_extend — one-click extend for our own sbatch sub-jobs (cosmos-server,
+# daaam-worker). Called by cmd_extend only after it has already confirmed the
+# job is running and its GPU power is above NSC's floor right now — this
+# function's job is just "resubmit the same work as a dependent follow-up
+# job", not to re-check load itself.
+hook_extend() {
+    local jobid="$1" jobname="$2"
+
+    local reg_file="$PROJECT/.bjob/smart-auto-session.$jobid"
+    if [[ ! -f "$reg_file" ]]; then
+        printf "${R}  No session state registered for job %s — can't extend.${NC}\n" "$jobid"
+        printf "  ${DIM}(only jobs launched via the daaam-cosmos 'afk' launch mode register one)${NC}\n"
+        return 1
+    fi
+    local state_dir; state_dir=$(cat "$reg_file")
+
+    # Recover what this job was actually granted, so the follow-up matches —
+    # don't trust config.sh, the job may have been submitted with overrides.
+    local info account partition gpus mem
+    info=$(scontrol show job "$jobid" 2>/dev/null) || info=""
+    account=$(grep -oP '(?<= Account=)\S+' <<<"$info" | head -1)
+    partition=$(grep -oP '(?<= Partition=)\S+' <<<"$info" | head -1)
+    gpus=$(grep -oP 'gpu[:=]\K[0-9]+' <<<"$info" | head -1); gpus="${gpus:-1}"
+    mem=$(grep -oP '(?<= Mem=)[0-9A-Za-z]+' <<<"$info" | head -1)
+    if [[ -z "$account" || -z "$partition" ]]; then
+        printf "${R}  Could not read job %s's account/partition via scontrol — can't extend.${NC}\n" "$jobid"
+        return 1
+    fi
+
+    local out jid
+    case "$jobname" in
+        cosmos-server)
+            out=$(sbatch \
+                --account="$account" --partition="$partition" --gpus="$gpus" \
+                --time=00:59:59 --mem="${mem:-80G}" --job-name=cosmos-server \
+                --dependency="afterany:$jobid" \
+                --output="$state_dir/logs/cosmos_slurm-%j.log" \
+                --export=ALL,DAAAM_PROFILE_DIR="$JOBS_DIR/daaam-cosmos",DAAAM_AUTO_STATE_DIR="$state_dir" \
+                "$JOBS_DIR/daaam-cosmos/sbatch_cosmos.sh" 2>&1) || {
+                printf "${R}  Failed to queue follow-up cosmos-server job:\n  %s${NC}\n" "$out"
+                return 1
+            }
+            jid=$(awk '{print $NF}' <<<"$out")
+            printf "${G}  Queued cosmos-server follow-up: job %s (starts once %s ends).${NC}\n" "$jid" "$jobid"
+            ;;
+        daaam-worker)
+            # sbatch_daaam.sh's own _on_exit trap ALREADY auto-resubmits
+            # unconditionally when it exits with batches still remaining
+            # (that's its whole job) -- unless auto.done/auto.stop is set.
+            # A running job hasn't hit either yet, so without a coordination
+            # marker, extending here would queue a follow-up AND let that
+            # trap queue its own independent one when this job later times
+            # out -- two dependent jobs racing over the same current_batch
+            # checkpoint. extended.$jobid below is that marker; sbatch_daaam.sh
+            # checks it next to auto.done/auto.stop.
+            if [[ -e "$state_dir/auto.done" ]]; then
+                printf "${R}  Job %s already finished all its batches (auto.done set) — nothing to extend.${NC}\n" "$jobid"
+                return 1
+            fi
+            if [[ -e "$state_dir/auto.stop" ]]; then
+                printf "${R}  Job %s was stopped deliberately (auto.stop set) — not resubmitting blindly.${NC}\n" "$jobid"
+                printf "  ${DIM}check %s/logs/auto_launch.log for why, then remove auto.stop if you want to continue.${NC}\n" "$state_dir"
+                return 1
+            fi
+
+            local resume_batch batch_end
+            resume_batch=$(sed 's/^batch_//' "$state_dir/current_batch" 2>/dev/null)
+            batch_end=$(cat "$state_dir/batch_end" 2>/dev/null)
+            if [[ -z "$resume_batch" || -z "$batch_end" ]]; then
+                printf "${R}  No checkpoint (current_batch/batch_end) in %s — can't tell where to resume.${NC}\n" "$state_dir"
+                return 1
+            fi
+            out=$(sbatch \
+                --account="$account" --partition="$partition" --gpus="$gpus" \
+                --time=00:59:59 --mem="${mem:-80G}" --job-name=daaam-worker \
+                --dependency="afterany:$jobid" \
+                --output="$state_dir/logs/daaam_slurm-%j.log" \
+                --export=ALL,DAAAM_PROFILE_DIR="$JOBS_DIR/daaam-cosmos",DAAAM_AUTO_STATE_DIR="$state_dir",DAAAM_AUTO_BATCH_START="$resume_batch",DAAAM_AUTO_BATCH_END="$batch_end",DAAAM_SBATCH_MEM="${mem:-80G}",DAAAM_SBATCH_GPUS="$gpus" \
+                "$JOBS_DIR/daaam-cosmos/sbatch_daaam.sh" 2>&1) || {
+                printf "${R}  Failed to queue follow-up daaam-worker job:\n  %s${NC}\n" "$out"
+                return 1
+            }
+            jid=$(awk '{print $NF}' <<<"$out")
+            # Suppress $jobid's own auto-resubmit now that we've queued one
+            # by hand -- must be written before returning, not best-effort
+            # skipped, or the double-submit this exists to prevent still happens.
+            if ! printf '%s\n' "$jid" > "$state_dir/extended.$jobid"; then
+                printf "${Y}  warn${NC}  Queued follow-up job %s, but could not write %s/extended.%s.\n" \
+                    "$jid" "$state_dir" "$jobid"
+                printf "  ${DIM}%s's own exit trap will now ALSO resubmit when it times out --\n" "$jobid"
+                printf "        cancel one of the two duplicate follow-ups once both exist.${NC}\n"
+            fi
+            printf "${G}  Queued daaam-worker follow-up: job %s, resuming batch_%s..batch_%s once %s ends.${NC}\n" \
+                "$jid" "$resume_batch" "$batch_end" "$jobid"
+            ;;
+        *)
+            printf "${R}  Unknown daaam-cosmos job name '%s' — can't extend.${NC}\n" "$jobname"
+            return 1
+            ;;
+    esac
+}
+
 hook_launch() {
     local name="$1" mode
     if mode="$(prompt_afk_launch_mode)"; then
@@ -89,8 +191,9 @@ _AUTO_BATCH_END=""
 prompt_afk_launch_mode() {
     printf "\n${BOLD}${Y}  daaam-cosmos launch mode${NC}\n\n" >&2
     printf "  1) interactive   srun — one shared allocation (cosmos + DAAAM share one GPU)\n" >&2
-    printf "  2) afk           sbatch — separate cosmos (4 h) and DAAAM (59:59) allocations,\n" >&2
-    printf "                   DAAAM resubmits automatically until all batches finish\n" >&2
+    printf "  2) afk           sbatch — separate cosmos and DAAAM allocations, both 59:59.\n" >&2
+    printf "                   DAAAM auto-resubmits until all batches finish; run\n" >&2
+    printf "                   'bjob extend <jobid>' on either job to push it further\n" >&2
     printf "  q) cancel\n\n" >&2
     local choice
     read -rp "  Choice [1]: " choice
@@ -184,7 +287,7 @@ launch_afk() {
     printf "\n${BOLD}${Y}  afk launch — %s${NC}\n" "$session_id"
     printf "  State dir:  %s\n" "$state_dir"
     printf "  Batches:    batch_%s..batch_%s\n" "$_AUTO_BATCH_START" "$_AUTO_BATCH_END"
-    printf "  Cosmos:     4 h · %s GPU · %s · %s\n" "$daaam_gpus" "$cosmos_mem" "$D_PARTITION"
+    printf "  Cosmos:     59:59 · %s GPU · %s · %s (bjob extend to push further)\n" "$daaam_gpus" "$cosmos_mem" "$D_PARTITION"
     printf "  DAAAM:      59:59 · %s GPU · %s · %s (auto-resubmit)\n" "$daaam_gpus" "$daaam_mem" "$D_PARTITION"
     printf "\n"
     local confirm
@@ -206,13 +309,14 @@ launch_afk() {
 
     local profile_dir="$JOBS_DIR/$name"
 
-    # Submit cosmos server (4 h)
+    # Submit cosmos server (59:59 — same power-floor exemption as everything
+    # else; use 'bjob extend <jobid>' once it's genuinely serving requests)
     local cosmos_out
     if ! cosmos_out=$(sbatch \
             --account="$D_ACCOUNT" \
             --partition="$D_PARTITION" \
             --gpus="$daaam_gpus" \
-            --time=04:00:00 \
+            --time=00:59:59 \
             --mem="$cosmos_mem" \
             --job-name=cosmos-server \
             --output="$state_dir/logs/cosmos_slurm-%j.log" \
