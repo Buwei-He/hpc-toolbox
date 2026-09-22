@@ -1,0 +1,185 @@
+#!/bin/bash
+# toolbox-doctor — catch the two things that get us in trouble on Berzelius:
+# scripts that can spin a CPU core, and processes already doing it.
+#
+#   toolbox-doctor            both checks
+#   toolbox-doctor lint       static: scan bin/ for busy-wait / unguarded TUI
+#   toolbox-doctor procs      runtime: find runaway processes owned by $USER
+#
+# Background: bjob once burned a core for days and drew an admin warning. The
+# cause was `IFS= read -rsn1 key 2>/dev/null || true` inside `while true` — with
+# no TTY, read fails instantly, `|| true` hides it, and the loop never blocks.
+# Agents always run non-interactively, so they hit exactly this path.
+#
+# Exit: 0 clean · 1 findings · 2 wrong environment.
+
+set -uo pipefail
+
+TOOLBOX="${TOOLBOX_DIR:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+BIN_DIR="$TOOLBOX/bin"
+
+# A process is suspicious when CPU time tracks wall-clock time. Long elapsed
+# time on its own is normal (editors, systemd) and must not be flagged.
+MIN_ELAPSED="${DOCTOR_MIN_ELAPSED:-300}"      # ignore anything younger than 5 min
+BUSY_RATIO="${DOCTOR_BUSY_RATIO:-50}"         # percent of elapsed spent on CPU
+
+R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' DIM='\033[2m' NC='\033[0m'
+ok()   { printf "${G}  ok${NC}    %s\n" "$*"; }
+bad()  { printf "${R}  FAIL${NC}  %s\n" "$*"; }
+warn() { printf "${Y}  warn${NC}  %s\n" "$*"; }
+note() { printf "${DIM}        %s${NC}\n" "$*"; }
+
+FINDINGS=0
+
+# ── static lint ───────────────────────────────────────────────────────────────
+lint_file() {
+    local f="$1" base hits
+    base=$(basename "$f")
+    hits=0
+
+    # 1. `read` whose failure is swallowed — the exact bjob bug. Only a real
+    #    spin when it sits INSIDE a loop and has no -t timeout; a one-shot
+    #    "press any key" just skips its pause, so it must not cry wolf.
+    #    Comments are stripped first, or this file matches its own docs.
+    local spins oneshots
+    spins=$(awk '
+        { line=$0; sub(/#.*/, "", line)
+          if (line ~ /(^|[[:space:];])(while|until|for)[[:space:]]/) depth++
+          if (line ~ /(^|[[:space:];])done([[:space:];]|$)/ && depth>0) depth--
+          if (line ~ /read[^|]*\|\|[[:space:]]*true/ && line !~ /read[^|]*-t[[:space:]]/ && depth>0)
+              printf "%d:%s\n", NR, $0 }' "$f")
+    oneshots=$(awk '
+        { line=$0; sub(/#.*/, "", line)
+          if (line ~ /(^|[[:space:];])(while|until|for)[[:space:]]/) depth++
+          if (line ~ /(^|[[:space:];])done([[:space:];]|$)/ && depth>0) depth--
+          if (line ~ /read[^|]*\|\|[[:space:]]*true/ && line !~ /read[^|]*-t[[:space:]]/ && depth==0)
+              printf "%d\n", NR }' "$f" | wc -l)
+
+    # Does the file refuse to run without a TTY? Must be bracket-anchored:
+    # a bare '-t 0' also appears in `read -t 0.1`, which is a timeout, not a guard.
+    local has_guard=0
+    grep -qE '\[\[?[^]]*-t[[:space:]]+[01][[:space:]]*\]|tty[[:space:]]+-s' "$f" 2>/dev/null && has_guard=1
+
+    if [ -n "$spins" ]; then
+        if [ "$has_guard" -eq 1 ]; then
+            warn "$base: 'read || true' inside a loop, but the file has a TTY guard"
+            note "protected at the entry point — keep the guard in front of every such path"
+            hits=$((hits + 1))
+        else
+            bad "$base: 'read ... || true' inside a loop, no -t, NO TTY guard — will spin"
+            printf '%s\n' "$spins" | sed 's/^/          /'
+            hits=$((hits + 1))
+        fi
+    fi
+    if [ "${oneshots:-0}" -gt 0 ] && [ "$has_guard" -eq 0 ]; then
+        warn "$base: $oneshots one-shot 'read || true' and no TTY guard"
+        note "harmless (skips a pause) but add a guard so the behaviour is explicit"
+        hits=$((hits + 1))
+    fi
+
+    # 2. Single-key reads without any TTY guard in the file.
+    if grep -qE 'read -[a-z]*n1|read -rsn1' "$f" 2>/dev/null; then
+        if ! grep -qE '\-t 0|\-t 1|tty -s' "$f" 2>/dev/null; then
+            bad "$base: reads single keys but never checks for a TTY"
+            note "add:  [ -t 0 ] && [ -t 1 ] || { echo 'needs a TTY' >&2; exit 2; }"
+            hits=$((hits + 1))
+        fi
+    fi
+
+    # 3. `while true` bodies with no sleep / blocking call anywhere near them.
+    #    Deliberately coarse: reports for a human to confirm, never auto-edits.
+    local ln
+    while IFS= read -r ln; do
+        local start end body
+        start="${ln%%:*}"
+        end=$((start + 25))
+        body=$(sed -n "${start},${end}p" "$f")
+        if ! printf '%s' "$body" | grep -qE 'sleep|read -t|wait |squeue|curl|ssh |exit|return|break'; then
+            warn "$base:$start: 'while true' with no sleep/blocking call in the next 25 lines"
+            hits=$((hits + 1))
+        fi
+    done < <(grep -nE '^[[:space:]]*while[[:space:]]+true' "$f" 2>/dev/null)
+
+    [ "$hits" -eq 0 ] && ok "$base"
+    FINDINGS=$((FINDINGS + hits))
+}
+
+cmd_lint() {
+    printf "toolbox-doctor lint — %s\n\n" "$BIN_DIR"
+    [ -d "$BIN_DIR" ] || { bad "no bin/ at $BIN_DIR"; exit 2; }
+    local f found=0
+    for f in "$BIN_DIR"/*; do
+        [ -f "$f" ] || continue
+        case "$f" in *.bak_*|*.bak) continue ;; esac   # backups are not shipped
+        head -1 "$f" | grep -q '^#!.*sh' || continue
+        lint_file "$f"
+        found=$((found + 1))
+    done
+    [ "$found" -eq 0 ] && warn "no shell scripts found in $BIN_DIR"
+    printf "\n"
+}
+
+# ── runtime process check ─────────────────────────────────────────────────────
+cmd_procs() {
+    printf "toolbox-doctor procs — %s on %s\n\n" "$USER" "$(hostname -s)"
+    printf "${DIM}        flagging: elapsed > %ss AND cpu-time > %s%% of elapsed${NC}\n\n" \
+        "$MIN_ELAPSED" "$BUSY_RATIO"
+
+    local out
+    out=$(ps -u "$USER" -o pid=,etimes=,times=,pcpu=,args= 2>/dev/null \
+        | awk -v me="$MIN_ELAPSED" -v br="$BUSY_RATIO" '
+            {
+              pid=$1; et=$2; ct=$3; pc=$4;
+              cmd=""; for (i=5; i<=NF; i++) cmd = cmd $i " ";
+              if (et+0 > me+0 && et+0 > 0) {
+                  ratio = (ct+0) * 100.0 / (et+0);
+                  if (ratio > br+0) printf "%s|%s|%s|%.0f|%s\n", pid, et, ct, ratio, cmd;
+              }
+            }')
+
+    if [ -z "$out" ]; then
+        ok "no runaway processes"
+        note "long-elapsed idle processes (editors, systemd) are fine and not flagged"
+    else
+        while IFS='|' read -r pid et ct ratio cmd; do
+            [ -n "$pid" ] || continue
+            bad "pid $pid — ${ratio}% cpu over ${et}s elapsed (${ct}s cpu)"
+            note "$cmd"
+            note "inspect:  ps -p $pid -o lstart=,args=    stop:  kill $pid"
+            FINDINGS=$((FINDINGS + 1))
+        done <<< "$out"
+    fi
+
+    # A login node should never be hosting a service or a job's work.
+    if [ -z "${SLURM_JOB_ID:-}" ] && hostname -s | grep -qE '^berzelius[0-9]'; then
+        printf "\n"
+        note "on a login node: nothing long-running belongs here — use a SLURM job"
+    fi
+    printf "\n"
+}
+
+case "${1:-all}" in
+    lint)  cmd_lint ;;
+    procs) cmd_procs ;;
+    all)   cmd_lint; cmd_procs ;;
+    *)
+        cat <<USAGE
+toolbox-doctor — CPU-spin hazards, static and live
+
+  toolbox-doctor          run both checks
+  toolbox-doctor lint     scan bin/ for busy-wait / unguarded key reads
+  toolbox-doctor procs    find processes whose cpu time tracks wall-clock time
+
+env:
+  DOCTOR_MIN_ELAPSED   default 300 (seconds before a process is considered)
+  DOCTOR_BUSY_RATIO    default 50  (percent of elapsed spent on CPU to flag)
+USAGE
+        exit 2 ;;
+esac
+
+if [ "$FINDINGS" -gt 0 ]; then
+    printf "${R}%s finding(s)${NC} — see above\n" "$FINDINGS"
+    exit 1
+fi
+printf "${G}clean${NC}\n"
+exit 0

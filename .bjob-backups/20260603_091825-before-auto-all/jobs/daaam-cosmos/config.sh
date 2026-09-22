@@ -1,0 +1,6 @@
+D_ACCOUNT="berzelius-2026-36"
+D_PARTITION="berzelius"
+D_GPUS="1"
+D_TIME="12:00:00"
+D_MEM="72G"
+D_JOBNAME="daaam-cosmos"

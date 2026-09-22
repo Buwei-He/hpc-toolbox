@@ -1,0 +1,848 @@
+#!/bin/bash
+# percorso-demo — run the live-demo pipeline on Berzelius against an EGG rosbag.
+#
+# This file lives at  $PROJECT/berzelius-toolbox/bin/percorso-demo
+# and is on PATH via  ~/bin/percorso-demo  (a symlink).  `percorso-demo where`
+# prints that plus every other path it uses.
+#
+# A controlled stand-in for the robot: the bag replaces the sensor, everything
+# else (bridge, rolling buffer, mid-run event refresh, remote query) is the real
+# demo path. Run this INSIDE a SLURM job on a compute node.
+#
+#   percorso-demo where              print the paths this tool uses
+#   percorso-demo overlay            one-time: build the demo ROS overlay
+#   percorso-demo doctor             verify the demo code is what will actually run
+#   percorso-demo status             what is running on THIS node, and is it healthy
+#   percorso-demo zenoh              start the ROS-topic bridge (background)
+#   percorso-demo pipeline [label]   start perception + bridge (foreground)
+#   percorso-demo bag [batch]        play the rosbag LOCALLY
+#   percorso-demo logs <svc> [-f]    tail a background service's log
+#   percorso-demo stop <svc|all>     stop background services
+#
+# Two ways to feed the pipeline:
+#   'bag'   — bag plays here on the server. Tests the query path only.
+#   'zenoh' — the robot runs ros2 bag play (or a real camera) and a zenoh bridge
+#             in client mode; topics arrive as real ROS topics. This is the
+#             supported transport. ('ingest' is the retired custom version.)
+#
+# Why background services: the documented workflow is ONE tmux window inside ONE
+# Apptainer shell inside ONE SLURM job. A second terminal means a second ssh hop
+# and re-attaching to a private compute node — so anything that is a daemon
+# rather than something you watch (zenoh) detaches by default and leaves a
+# pidfile + log behind. Add --fg to watch it instead; add --bg to detach the
+# things that normally run in the foreground.
+#
+# Why an overlay: the demo ROS package is percorso_perception_ros, built in its own
+# workspace next to the paper's daaam_ros. Because the names differ, sourcing order
+# no longer decides which one you get and `ros2 launch percorso_perception_ros ...`
+# cannot resolve to paper code. What is still chosen by environment is the Python
+# lib `daaam` (via PYTHONPATH) — but that one fails loudly: the demo node imports a
+# module the paper lib does not have. 'doctor' reports every layer anyway.
+#
+# Exit: 0 ok · 1 expected failure with the next step · 2 wrong place.
+
+set -uo pipefail
+
+# Resolve through the ~/bin symlink: "where is this file" is the question this
+# answers, and the symlink is not the answer you can edit.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+INVOKED_AS="${BASH_SOURCE[0]}"
+
+PROJECT="${PROJECT:-/proj/rpl-soro/users/$USER}"
+SIF="${PERCORSO_SIF:-$PROJECT/containers/daaam.sif}"
+OVERLAY="${PERCORSO_OVERLAY:-$PROJECT/percorso_overlay}"
+DEMO_LIB="${PERCORSO_DEMO_LIB:-/ros2_ws/src/percorso-perception/src}"
+DEMO_ROS="${PERCORSO_DEMO_ROS:-$PROJECT/ros2_ws/src/percorso-perception-ros}"
+BATCH="${PERCORSO_BATCH:-batch_7}"          # smallest EGG bag — fastest first test
+BRIDGE_PORT="${PERCORSO_BRIDGE_PORT:-8100}"
+ZENOH_PORT="${PERCORSO_ZENOH_PORT:-7447}"
+ZENOH_BIN="${PERCORSO_ZENOH_BIN:-$PROJECT/zenoh/zenoh-bridge-ros2dds}"
+
+# Runtime state is PER NODE on purpose: compute nodes are ephemeral, so a pidfile
+# from yesterday's node describes a process that cannot exist. Under $PROJECT so
+# it is visible from both inside and outside the container.
+RUN_DIR="${PERCORSO_RUN_DIR:-$PROJECT/.percorso/run/$(hostname -s)}"
+
+R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' DIM='\033[2m' NC='\033[0m'
+ok()   { printf "${G}  ok${NC}    %s\n" "$*"; }
+warn() { printf "${Y}  warn${NC}  %s\n" "$*"; }
+note() { printf "${DIM}        %s${NC}\n" "$*"; }
+die()  { printf "${R}  fail${NC}  %s\n" "$1" >&2; shift || true
+         for l in "$@"; do printf "${DIM}        %s${NC}\n" "$l" >&2; done; exit 1; }
+
+# The one environment recipe that makes the DEMO code win over the paper code:
+# overlay sourced AFTER the main install, demo lib prepended to PYTHONPATH.
+container_preamble() {
+    printf "source /ros2_ws/setup_daaam.sh >/dev/null 2>&1\n"
+    printf "[ -f '%s/install/setup.bash' ] && source '%s/install/setup.bash' >/dev/null 2>&1\n" \
+           "$OVERLAY" "$OVERLAY"
+    printf "export PYTHONPATH='%s':\$PYTHONPATH\n" "$DEMO_LIB"
+    printf "export PROJECT='%s'\n" "$PROJECT"
+}
+
+# Works whether you are already inside the Apptainer shell or outside it. This
+# matters: the documented workflow is `apptainer shell` first, and there is NO
+# apptainer binary inside the container, so nesting `apptainer exec` does not
+# merely misbehave — it cannot run at all. Detect and run the payload directly.
+inside_container() {
+    [ -n "${APPTAINER_CONTAINER:-}${SINGULARITY_CONTAINER:-}" ] || [ -d /.singularity.d ]
+}
+
+apptainer_argv() {
+    printf '%s\n' apptainer exec --nv \
+        -B "$PROJECT/ros2_ws:/ros2_ws" \
+        -B "$PROJECT/rosbags:/rosbags" \
+        -B "$PROJECT:$PROJECT" \
+        "$SIF"
+}
+
+in_container() {
+    # The $'\n' is load-bearing: $(...) strips trailing newlines, so without it the
+    # last preamble line and the command are glued into one statement. That failure
+    # is silent (the mangled line just exits non-zero and prints nothing), and it
+    # cost a debugging round — the background path builds a script file instead and
+    # so never hit it, which made the bug look like a broken zenoh binary.
+    local payload; payload="$(container_preamble)"$'\n'"$1"
+    if inside_container; then
+        bash -lc "$payload"
+    else
+        local argv=(); mapfile -t argv < <(apptainer_argv)
+        "${argv[@]}" bash -lc "$payload"
+    fi
+}
+
+require_job() {
+    [ -n "${SLURM_JOB_ID:-}" ] || die "not inside a SLURM job" \
+        "this needs a compute node — start one with:  bjob → percorso" \
+        "login nodes must not run the pipeline"
+}
+
+cosmos_url() {
+    if [ -n "${COSMOS_URL:-}" ]; then printf '%s' "$COSMOS_URL"; return; fi
+    [ -s "$PROJECT/.cosmos_url" ] && tr -d '\n' < "$PROJECT/.cosmos_url"
+}
+
+# Exact job-name match, not a substring: 'cosmos' would also match 'daaam-cosmos'
+# and point at the wrong node. Unavailable inside the container — there is no
+# squeue in there, which is why the URL travels through a file at all.
+cosmos_node() {
+    command -v squeue >/dev/null 2>&1 || return 1
+    squeue -u "$USER" -h -o "%j|%T|%N" 2>/dev/null \
+      | awk -F'|' '$1=="cosmos-reason2" && $2=="RUNNING" && $3!="" {print $3; exit}'
+}
+
+# Called only when the recorded URL does not answer. $PROJECT/.cosmos_url is written
+# by cosmos at boot, so after a job restart it can name a node that runs nothing —
+# the "came back days later, no idea where to start" case. Say which of the two it
+# is instead of just "not answering".
+cosmos_diagnose() {
+    local url="$1" host node
+    host=${url#*://}; host=${host%%:*}
+    if node=$(cosmos_node) && [ -n "$node" ]; then
+        if [ "$node" != "$host" ]; then
+            note "SLURM says cosmos-reason2 runs on '$node', but the URL names '$host'"
+            note "the recorded URL is stale — cosmos rewrites it at boot"
+            note "use the live one:  export COSMOS_URL=http://$node:8000/v1"
+        else
+            note "cosmos-reason2 is on $node but not answering yet — still loading weights?"
+        fi
+        return
+    fi
+    [ -s "$PROJECT/.cosmos_url" ] \
+        && note "recorded $(date -r "$PROJECT/.cosmos_url" '+%Y-%m-%d %H:%M') in \$PROJECT/.cosmos_url"
+    if command -v squeue >/dev/null 2>&1; then
+        note "no RUNNING cosmos-reason2 job — start it:  bjob"
+    else
+        note "no squeue in the container; check from a login node:  squeue -u $USER"
+        note "if cosmos just started, the URL file is rewritten at boot — wait and retry"
+    fi
+}
+
+# ── background services ───────────────────────────────────────────────────────
+svc_pidfile() { printf '%s/%s.pid' "$RUN_DIR" "$1"; }
+svc_logfile() { printf '%s/%s.log' "$RUN_DIR" "$1"; }
+
+# Prints a live pid, or fails. Deletes a pidfile whose process is gone, so a
+# service that crashed never reports itself as running.
+svc_pid() {
+    local f pid; f=$(svc_pidfile "$1")
+    [ -s "$f" ] || return 1
+    pid=$(cat "$f" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then printf '%s' "$pid"; return 0; fi
+    rm -f "$f"; return 1
+}
+
+# No /dev/tcp here: bash's builtin cannot be given a timeout without a subshell
+# dance, and `timeout` + exec redirection is the readable version.
+tcp_open() { timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+
+# svc_start <name> <shell-command-run-inside-the-container>
+#
+# The payload is written to a script under $RUN_DIR (bound into the container, so
+# the same file works from both sides) and the child writes its OWN pid. That is
+# deliberate: `$!` after `setsid` is only the payload's pid when setsid happens
+# not to fork, which depends on process-group state we do not control.
+svc_start() {
+    local name="$1" cmd="$2" pid pf lf sh
+    mkdir -p "$RUN_DIR"
+    pf=$(svc_pidfile "$name"); lf=$(svc_logfile "$name"); sh="$RUN_DIR/$name.cmd.sh"
+    if pid=$(svc_pid "$name"); then
+        ok "$name is already running (pid $pid)"
+        note "logs:  percorso-demo logs $name -f"
+        note "stop:  percorso-demo stop $name"
+        return 0
+    fi
+    { container_preamble; printf 'exec %s\n' "$cmd"; } > "$sh"
+    : > "$lf"
+    # setsid gives the payload its own process group, so `kill -- -pid` in
+    # svc_stop reaches the apptainer wrapper AND the real binary under it.
+    if inside_container; then
+        setsid nohup bash -c 'echo $$ > "$1"; exec bash "$2"' _ "$pf" "$sh" >>"$lf" 2>&1 &
+    else
+        local argv=(); mapfile -t argv < <(apptainer_argv)
+        setsid nohup bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pf" \
+               "${argv[@]}" bash "$sh" >>"$lf" 2>&1 &
+    fi
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -s "$pf" ] && break
+        sleep 0.2
+    done
+    if ! pid=$(svc_pid "$name"); then
+        warn "$name did not start"
+        svc_log_tail "$name" 15
+        return 1
+    fi
+    note "$name launched (pid $pid) → $lf"
+    return 0
+}
+
+# Bounded wait for a service to actually answer. Without this the tool would
+# report "started" for a process that is about to exit one line later, which is
+# exactly the "I have to figure it out from the outputs" failure mode.
+svc_wait_port() {
+    local name="$1" port="$2" tries="${3:-15}" i
+    for ((i = 0; i < tries; i++)); do
+        if ! svc_pid "$name" >/dev/null; then
+            warn "$name exited during startup"
+            svc_log_tail "$name" 15
+            return 1
+        fi
+        tcp_open "$port" && return 0
+        sleep 1
+    done
+    warn "$name is running but nothing is listening on 127.0.0.1:$port after ${tries}s"
+    svc_log_tail "$name" 15
+    return 1
+}
+
+svc_log_tail() {
+    local lf; lf=$(svc_logfile "$1")
+    [ -s "$lf" ] || { note "log is empty ($lf)"; return 0; }
+    printf "${DIM}        ── %s (last %s lines) ──${NC}\n" "$lf" "${2:-20}"
+    sed -e 's/^/          /' <(tail -n "${2:-20}" "$lf")
+}
+
+svc_stop() {
+    local name="$1" pid i
+    if ! pid=$(svc_pid "$name"); then
+        note "$name is not running"
+        return 0
+    fi
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    for ((i = 0; i < 10; i++)); do
+        svc_pid "$name" >/dev/null || { ok "$name stopped"; return 0; }
+        sleep 0.5
+    done
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+    sleep 0.5
+    svc_pid "$name" >/dev/null && { warn "$name (pid $pid) will not die"; return 1; }
+    ok "$name killed"
+}
+
+SERVICES="zenoh pipeline bag power ingest"
+
+# ── where ─────────────────────────────────────────────────────────────────────
+cmd_where() {
+    printf "percorso-demo — paths in use on %s\n\n" "$(hostname -s)"
+    printf "  this file   %s\n" "$SELF"
+    printf "  invoked as  %s\n" "$INVOKED_AS"
+    printf "  on PATH as  %s\n" "$(command -v percorso-demo || echo '(not on PATH)')"
+    printf "  edit with   \$EDITOR %s\n\n" "$SELF"
+    printf "  PROJECT     %s\n" "$PROJECT"
+    printf "  container   %s\n" "$SIF"
+    printf "  overlay     %s\n" "$OVERLAY"
+    printf "  demo lib    %s\n" "$DEMO_LIB"
+    printf "  demo ros    %s\n" "$DEMO_ROS"
+    printf "  zenoh bin   %s\n" "$ZENOH_BIN"
+    printf "  run dir     %s\n" "$RUN_DIR"
+    printf "\n"
+    note "run dir is per-node; pids/logs for services started here live in it"
+    note "the companion tool for the laptop side is percorso-net (in percorso-perception/tools)"
+}
+
+# ── overlay ───────────────────────────────────────────────────────────────────
+cmd_overlay() {
+    [ -d "$DEMO_ROS" ] || die "demo ROS package not found at $DEMO_ROS" \
+        "expected the percorso-perception-ros worktree"
+    mkdir -p "$OVERLAY/src"
+    # Link name is cosmetic (colcon reads package.xml, not directory names), so it
+    # matches the directory instead of impersonating the paper package.
+    rm -f "$OVERLAY/src/daaam_ros"          # remove the old disguised link
+    ln -sfn "$DEMO_ROS" "$OVERLAY/src/$(basename "$DEMO_ROS")"
+    printf "building the demo ROS overlay in %s\n" "$OVERLAY"
+    note "pure ament_cmake, no compilation — takes ~20 s"
+    if in_container "cd '$OVERLAY' && colcon build --symlink-install --packages-select percorso_perception_ros"; then
+        ok "overlay built"
+        note "re-run this only if you change package.xml / CMakeLists (py + launch edits are live)"
+    else
+        die "overlay build failed" "check the colcon output above"
+    fi
+}
+
+# ── doctor ────────────────────────────────────────────────────────────────────
+cmd_doctor() {
+    printf "percorso-demo doctor — %s\n\n" "$(hostname -s)"
+    local fails=0
+
+    if inside_container; then
+        ok "running INSIDE the Apptainer shell (${APPTAINER_NAME:-container})"
+        # The bjob shell is a PAPER environment on purpose (it must stay able to
+        # reproduce the paper). percorso-demo layers the demo env on per command,
+        # so everything below describes what PERCORSO-DEMO will run — not what a
+        # command you type yourself in this shell would run.
+        case ":${PYTHONPATH:-}:" in
+            *":$DEMO_LIB:"*) : ;;
+            *) note "this shell itself is the paper env: 'ros2 launch daaam_ros ...'"
+               note "runs the PAPER pipeline. The demo is percorso_perception_ros." ;;
+        esac
+    else
+        ok "running outside the container — will use apptainer exec"
+        [ -f "$SIF" ] || die "no container at $SIF"
+    fi
+
+    if [ -f "$OVERLAY/install/setup.bash" ]; then
+        ok "overlay present"
+    else
+        warn "no overlay — the PAPER node would run instead of the demo one"
+        note "fix:  percorso-demo overlay"
+        fails=$((fails+1))
+    fi
+
+    # Must be tested INSIDE the container: the login node has older glibc and the
+    # binary fails there with "GLIBC_2.38 not found" even though it runs fine in
+    # the container. Gate on exit status, not on output — printing a linker error
+    # as "ok" is worse than no check at all.
+    if [ ! -x "$ZENOH_BIN" ]; then
+        warn "no zenoh bridge at $ZENOH_BIN — remote feeding unavailable"
+        note "see $PROJECT/zenoh/README.md"
+        fails=$((fails+1))
+    elif zver=$(in_container "'$ZENOH_BIN' --version" 2>/dev/null | tail -1) \
+         && printf '%s' "$zver" | grep -q "zenoh-bridge-ros2dds"; then
+        ok "zenoh bridge runs in-container ($zver)"
+    else
+        warn "zenoh bridge present but will not run inside the container"
+        note "wrong build? use the x86_64-unknown-linux-gnu-standalone asset"
+        note "the musl build needs /lib/ld-musl-x86_64.so.1, which is absent"
+        fails=$((fails+1))
+    fi
+
+    # Only needed for 'percorso-demo bag' (local replay). With zenoh feeding the
+    # bag lives on the robot, so a missing local bag is not a failure.
+    local bag="$PROJECT/ros2_ws/data/EGG-Dataset/bags/egg_${BATCH}_full.bag"
+    if [ -e "$bag" ]; then
+        ok "local bag available for 'bag' mode ($(basename "$bag"), $(du -sh "$bag" 2>/dev/null | cut -f1))"
+    else
+        note "no local bag for '$BATCH' — fine if the robot is feeding over zenoh"
+    fi
+
+    # The decisive check: what will the demo launch actually execute?
+    printf "\n  resolving what will really run:\n"
+    local report
+    report=$(in_container '
+        NODE=$(readlink -f $(ros2 pkg prefix percorso_perception_ros)/lib/percorso_perception_ros/daaam_node.py 2>/dev/null)
+        LIB=$(python3 -c "import daaam,pathlib;print(pathlib.Path(daaam.__file__).parent)" 2>/dev/null)
+        LAUNCH=$(ros2 pkg prefix percorso_perception_ros)/share/percorso_perception_ros/launch/egg_daaam_hydra.launch.yaml
+        printf "node|%s\n" "$NODE"
+        printf "lib|%s\n" "$LIB"
+        printf "bridge|%s\n" "$(grep -c LiveQueryBridge "$NODE" 2>/dev/null || echo 0)"
+        printf "args|%s\n" "$(grep -c enable_live_hoi_query "$LAUNCH" 2>/dev/null || echo 0)"
+        SHARE=$(ros2 pkg prefix percorso_perception_ros)/share/percorso_perception_ros
+        printf "hydra|%s\n" "$(readlink -f "$SHARE/config/hydra_config/egg_dataset_khronos_dynamic.yaml" 2>/dev/null)"
+        printf "engine|%s\n" "$(ls '"${DEMO_LIB%/src}"'/checkpoints/fastsam/*.engine 2>/dev/null | head -1)"
+        printf "labels|%s\n" "$([ -r "$SHARE/config/labels_pseudo.yaml" ] && [ -r "$SHARE/config/labels_pseudo.csv" ] && echo "$SHARE/config/labels_pseudo.yaml")"
+    ' 2>/dev/null)
+
+    local node lib bridge args engine labels hydra
+    node=$(printf '%s' "$report"   | awk -F'|' '$1=="node"{print $2}')
+    lib=$(printf '%s' "$report"    | awk -F'|' '$1=="lib"{print $2}')
+    bridge=$(printf '%s' "$report" | awk -F'|' '$1=="bridge"{print $2}')
+    args=$(printf '%s' "$report"   | awk -F'|' '$1=="args"{print $2}')
+    engine=$(printf '%s' "$report" | awk -F'|' '$1=="engine"{print $2}')
+    hydra=$(printf '%s' "$report"  | awk -F'|' '$1=="hydra"{print $2}')
+    labels=$(printf '%s' "$report" | awk -F'|' '$1=="labels"{print $2}')
+
+    case "$node" in
+        *percorso-perception-ros*) ok "node  → demo   ($node)" ;;
+        "") warn "percorso_perception_ros not found — the overlay is missing"
+            note "fix:  percorso-demo overlay"
+            note "(it can no longer silently fall back to the paper package: the names differ)"
+            fails=$((fails+1)) ;;
+        *)  warn "node resolved outside the demo worktree ($node)"; fails=$((fails+1)) ;;
+    esac
+    case "$lib" in
+        *percorso-perception*) ok "daaam → demo   ($lib)" ;;
+        "") warn "could not import daaam"; fails=$((fails+1)) ;;
+        *)  warn "daaam → PAPER  ($lib)"; fails=$((fails+1)) ;;
+    esac
+    [ "${bridge:-0}" -gt 0 ] 2>/dev/null && ok "node contains LiveQueryBridge" \
+        || { warn "node has no LiveQueryBridge — wrong code"; fails=$((fails+1)); }
+    [ "${args:-0}" -gt 0 ] 2>/dev/null && ok "launch file accepts enable_live_hoi_query" \
+        || { warn "launch file lacks the live args"; fails=$((fails+1)); }
+
+    # Configs travel separately from code: the launch file resolves them through
+    # find-pkg-share, so a stale absolute override can feed PAPER configs to a run
+    # whose node and lib are both correctly demo. That happened; hence this check.
+    case "$hydra" in
+        *percorso-perception-ros*) ok "hydra cfg → demo   ($hydra)" ;;
+        "") warn "could not resolve the hydra config"; fails=$((fails+1)) ;;
+        *)  warn "hydra cfg → PAPER  ($hydra)"
+            note "the overlay is stale, or something passes hydra_config_path explicitly"
+            fails=$((fails+1)) ;;
+    esac
+
+    # Untracked/ignored data files. `git worktree` materialises only TRACKED files,
+    # so a demo worktree can look perfectly correct and still die at init. Both of
+    # these did exactly that; checking here beats grepping a launch log for one
+    # FileNotFoundError.
+    if [ -n "$engine" ]; then
+        ok "segmenter engine  ($engine)"
+    else
+        warn "no FastSAM .engine in ${DEMO_LIB%/src}/checkpoints/fastsam/"
+        note "untracked in the paper repo, so the worktree never got it — link it:"
+        note "  ln -sfn ../daaam/checkpoints ${DEMO_LIB%/src}/checkpoints"
+        note "without it daaam_node dies at init with FileNotFoundError"
+        fails=$((fails+1))
+    fi
+    if [ -n "$labels" ]; then
+        ok "labelspace       (labels_pseudo.yaml + .csv)"
+    else
+        warn "labels_pseudo.yaml/.csv missing from the overlay share dir"
+        note "gitignored in the paper repo; copy the built pair into the demo config:"
+        note "  cp $PROJECT/ros2_ws/install/daaam_ros/share/daaam_ros/config/labels_pseudo.* \\"
+        note "     $DEMO_ROS/config/  &&  percorso-demo overlay"
+        note "without them hydra_ros_node aborts: Virtual config 'sensor' is not set"
+        fails=$((fails+1))
+    fi
+
+    printf "\n"
+    local cu; cu=$(cosmos_url)
+    if [ -n "$cu" ]; then
+        if curl -sf -m 5 -o /dev/null "${cu%/v1}/health" 2>/dev/null; then
+            ok "cosmos healthy at $cu"
+        else
+            warn "cosmos URL known ($cu) but not answering"
+            cosmos_diagnose "$cu"
+            fails=$((fails+1))
+        fi
+    else
+        warn "no cosmos URL — \$PROJECT/.cosmos_url is missing"
+        note "start it:  bjob → cosmos-reason2"
+        fails=$((fails+1))
+    fi
+
+    # Absorbed from the retired `percorso-net check`: these are server-side facts,
+    # so they belong in the server-side tool rather than in the robot's client.
+    if [ -n "${SLURM_JOB_ID:-}" ]; then
+        ok "inside SLURM job $SLURM_JOB_ID"
+    else
+        warn "no SLURM_JOB_ID — a login node cannot host the pipeline"
+        note "get a compute node:  bjob → percorso profile"
+        fails=$((fails+1))
+    fi
+    if curl -s -m 10 -o /dev/null -w '%{http_code}' https://api.openai.com/v1/models 2>/dev/null \
+        | grep -qE '^[1-5][0-9][0-9]$'; then
+        ok "outbound HTTPS works from this node"
+    else
+        warn "no outbound HTTPS — event grouping / semantic naming cannot call a hosted LLM"
+        note "the pipeline still runs; only those two stages are affected"
+        fails=$((fails+1))
+    fi
+    # A bound bridge port is only a problem if it is not OUR bridge already.
+    if curl -sf -m 3 -o /dev/null "http://127.0.0.1:$BRIDGE_PORT/status" 2>/dev/null; then
+        ok "bridge port $BRIDGE_PORT already serving — a pipeline is running here"
+    elif python3 -c "
+import socket,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+try: s.bind(('0.0.0.0',$BRIDGE_PORT)); s.close()
+except OSError as e: print(e); sys.exit(1)" 2>/dev/null; then
+        ok "bridge port $BRIDGE_PORT is free"
+    else
+        warn "cannot bind 0.0.0.0:$BRIDGE_PORT and nothing answers there"
+        note "something else holds it — pick another:  PERCORSO_BRIDGE_PORT=<port>"
+        fails=$((fails+1))
+    fi
+
+    printf "\n"
+    [ "$fails" -eq 0 ] && { ok "ready — percorso-demo zenoh, then percorso-demo pipeline"; return 0; }
+    die "$fails check(s) failed — fix the warnings above first"
+}
+
+# ── status ────────────────────────────────────────────────────────────────────
+cmd_status() {
+    printf "percorso-demo status — %s (job %s)\n\n" "$(hostname -s)" "${SLURM_JOB_ID:-none}"
+    local svc pid
+    for svc in $SERVICES; do
+        if pid=$(svc_pid "$svc"); then
+            ok "$svc  running (pid $pid)"
+        else
+            note "$svc  not running here"
+        fi
+    done
+    printf "\n"
+    if tcp_open "$ZENOH_PORT"; then
+        ok "zenoh port $ZENOH_PORT is accepting connections"
+    else
+        note "nothing on zenoh port $ZENOH_PORT — start it:  percorso-demo zenoh"
+    fi
+    if curl -sf -m 3 -o /dev/null "http://127.0.0.1:$BRIDGE_PORT/status" 2>/dev/null; then
+        ok "live query bridge answering on $BRIDGE_PORT"
+    else
+        note "no live query bridge on $BRIDGE_PORT — start it:  percorso-demo pipeline"
+    fi
+    local cu; cu=$(cosmos_url)
+    if [ -n "$cu" ] && curl -sf -m 5 -o /dev/null "${cu%/v1}/health" 2>/dev/null; then
+        ok "cosmos healthy at $cu"
+    else
+        note "cosmos not answering (${cu:-no URL known})"
+        [ -n "$cu" ] && cosmos_diagnose "$cu"
+    fi
+    printf "\n"
+    note "logs:  percorso-demo logs <svc> [-f]      dir: $RUN_DIR"
+    note "from the laptop:  percorso-net connect zenoh && percorso-net connect bridge"
+}
+
+# ── logs / stop ───────────────────────────────────────────────────────────────
+cmd_logs() {
+    local name="${1:-}" lf
+    [ -n "$name" ] || die "which service?" "one of: $SERVICES"
+    lf=$(svc_logfile "$name")
+    [ -e "$lf" ] || die "no log for '$name' at $lf" \
+        "it was never started on this node (run dir is per-node)"
+    if [ "${2:-}" = "-f" ] || [ "${2:-}" = "--follow" ]; then
+        printf "${DIM}tail -f %s — Ctrl-C to stop watching (the service keeps running)${NC}\n" "$lf"
+        tail -f "$lf"
+    else
+        tail -n "${2:-60}" "$lf"
+    fi
+}
+
+cmd_stop() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "stop what?" "a service name ($SERVICES) or 'all'"
+    if [ "$name" = "all" ]; then
+        local svc
+        for svc in $SERVICES; do svc_stop "$svc"; done
+        return 0
+    fi
+    svc_stop "$name"
+}
+
+# ── pipeline ──────────────────────────────────────────────────────────────────
+cmd_pipeline() {
+    # A LABEL, not a batch: with zenoh feeding, the bag is on the robot and the
+    # server has no bag at all. It only names the output directory. ('scene' is
+    # declared but never used by the egg launch file, so it is not passed.)
+    local label="live" bg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --bg) bg=1 ;;
+            --fg) bg="" ;;
+            -*)   die "unknown option '$1'" "pipeline takes [label] [--bg]" ;;
+            *)    label="$1" ;;
+        esac
+        shift
+    done
+    require_job
+    local cu; cu=$(cosmos_url)
+    [ -n "$cu" ] || die "no cosmos URL" "start cosmos first, or export COSMOS_URL=http://<node>:8000/v1"
+
+    printf "percorso-demo pipeline — run '%s' on %s\n" "$label" "$(hostname -s)"
+    note "cosmos:  $cu"
+    note "bridge:  http://$(hostname -s):$BRIDGE_PORT"
+    note "frames: percorso-demo zenoh (remote robot) or percorso-demo bag (local)"
+    note "from your laptop:  percorso-net connect bridge"
+    printf "\n"
+
+    # exit_after_clock=false on purpose: when the bag ends we want the node ALIVE
+    # so the last 30 s stays queryable. Sim time freezes, which is harmless here.
+    # hydra_config_path / input_config_path are deliberately NOT passed. The launch
+    # file defaults them to $(find-pkg-share daaam_ros)/config/..., which resolves
+    # through the overlay to the DEMO worktree. Passing the absolute
+    # /ros2_ws/src/daaam_ros/... paths (as the paper automation does) silently fed
+    # the PAPER configs to the demo run — an edit in percorso-perception-ros/config
+    # would have had no effect at all. The default is also self-correcting: it
+    # follows the overlay instead of an absolute path that can rot.
+    local cmd="ros2 launch percorso_perception_ros egg_daaam_hydra.launch.yaml \
+          depth_scale:=1000.0 \
+          exit_after_clock:=false \
+          verbosity:=1 \
+          save_human_clips:=true \
+          enable_cosmos_hoi_processing:=true \
+          cosmos_hoi_base_url:='$cu' \
+          cosmos_hoi_media_root:='$PROJECT' \
+          defer_dsg_processing:=false \
+          enable_live_hoi_query:=true \
+          live_buffer_sec:=30.0 \
+          live_bridge_port:=$BRIDGE_PORT \
+          enable_live_event_refresh:=true \
+          event_refresh_interval_sec:=120.0 \
+          output_run_prefix:=demo_${label}_"
+
+    if [ -z "$bg" ]; then
+        in_container "$cmd"
+        return
+    fi
+    svc_start pipeline "$cmd" || return 1
+    # Model load + TensorRT warmup dominate here, so allow far longer than zenoh.
+    if svc_wait_port pipeline "$BRIDGE_PORT" 180; then
+        ok "live query bridge answering on $(hostname -s):$BRIDGE_PORT"
+        note "watch it:  percorso-demo logs pipeline -f"
+    else
+        note "still starting? watch it:  percorso-demo logs pipeline -f"
+        return 1
+    fi
+}
+
+# ── bag ───────────────────────────────────────────────────────────────────────
+cmd_bag() {
+    local batch="$BATCH" loop="" bg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --loop) loop="--loop" ;;
+            --bg)   bg=1 ;;
+            -*)     die "unknown option '$1'" "bag takes [batch] [--loop] [--bg]" ;;
+            *)      batch="$1" ;;
+        esac
+        shift
+    done
+    require_job
+    local bag="/ros2_ws/data/EGG-Dataset/bags/egg_${batch}_full.bag"
+    printf "percorso-demo bag — %s%s\n" "$batch" "${loop:+ (looping)}"
+    note "the pipeline must already be up and printing 'Waiting for CameraInfo'"
+    printf "\n"
+    local cmd="ros2 bag play '$bag' --clock \
+          --qos-profile-overrides-path /ros2_ws/tools/egg_bag_qos_overrides.yaml $loop"
+    if [ -n "$bg" ]; then
+        # Nothing to probe: a bag player opens no port. Report the pid and move on.
+        svc_start bag "$cmd" || return 1
+        ok "bag replaying in the background"
+        note "watch it:  percorso-demo logs bag -f"
+        return 0
+    fi
+    in_container "$cmd"
+}
+
+# ── zenoh (remote feeding, the supported transport) ───────────────────────────
+cmd_zenoh() {
+    local fg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fg) fg=1 ;;
+            --bg) fg="" ;;
+            *)    die "unknown option '$1'" "zenoh takes [--fg]" ;;
+        esac
+        shift
+    done
+    require_job
+    [ -x "$ZENOH_BIN" ] || die "no zenoh bridge at $ZENOH_BIN" \
+        "download the x86_64-unknown-linux-gnu-standalone asset from" \
+        "https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases" \
+        "(the musl build will not run here — it wants /lib/ld-musl-x86_64.so.1)"
+
+    # 'router' is positional (a -m flag is rejected) and is the side that LISTENS;
+    # the robot runs 'client', which is connect-only. Multicast scouting off: it
+    # cannot cross the tunnel and only adds discovery noise.
+    local cmd="'$ZENOH_BIN' router -l tcp/0.0.0.0:$ZENOH_PORT --no-multicast-scouting"
+
+    printf "percorso-demo zenoh — router on %s:%s\n" "$(hostname -s)" "$ZENOH_PORT"
+    note "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}; the robot must use a DIFFERENT domain"
+    printf "\n"
+
+    if [ -n "$fg" ]; then
+        note "foreground: this terminal is now the router's; Ctrl-C stops it"
+        in_container "$cmd"
+        return
+    fi
+
+    svc_start zenoh "$cmd" || return 1
+    svc_wait_port zenoh "$ZENOH_PORT" 15 || return 1
+    ok "router listening on $(hostname -s):$ZENOH_PORT — this terminal is free"
+    printf "\n"
+    note "next, here:      percorso-demo pipeline"
+    note "on the robot:    percorso-net connect zenoh"
+    note "                 zenoh-bridge-ros2dds client -e tcp/127.0.0.1:$ZENOH_PORT --no-multicast-scouting"
+    note "watch / stop:    percorso-demo logs zenoh -f  ·  percorso-demo stop zenoh"
+}
+
+# ── power (staying above NSC's efficiency floor) ───────────────────────────────
+# NSC terminates jobs whose moving-average power stays below 90 W (idle is 52 W;
+# they have announced 100 W+). Exempt: the first hour of any job, NSC `interactive`
+# jobs under 8 h, and jobs in a reservation. sacct cannot tell you your draw —
+# energy accounting is off on this cluster (ConsumedEnergyRaw is 0 for every job) —
+# so it has to be sampled live, which is what this does.
+#
+# It reports; it does not keep you above the line. If a demo idles, the honest fixes
+# are a reservation (bjob 'percorso' profile sets one) or not holding the allocation
+# while nobody is interacting.
+POWER_FLOOR="${PERCORSO_POWER_FLOOR:-90}"     # NSC's current kill threshold, watts
+POWER_WARN="${PERCORSO_POWER_WARN:-120}"      # our own margin above the announced 100 W
+
+cmd_power() {
+    local dur=60 interval=5 watch=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --watch)    watch=1 ;;
+            --interval) interval="${2:-5}"; shift ;;
+            -*) die "unknown option '$1'" "power [seconds] [--interval N] [--watch]" ;;
+            *)  dur="$1" ;;
+        esac
+        shift
+    done
+    command -v nvidia-smi >/dev/null 2>&1 || die "no nvidia-smi here" \
+        "this reads the GPUs allocated to the job — run it on the compute node"
+
+    [ -n "${SLURM_JOB_ID:-}" ] || note "not inside a SLURM job — this reading is not what NSC measures"
+
+    local ngpu
+    ngpu=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | grep -c .)
+    [ "${ngpu:-0}" -gt 0 ] || die "nvidia-smi reported no GPUs" "is this job GPU-allocated?"
+
+    if [ -n "$watch" ]; then
+        # Detached: one line per sample into the service log, so you can leave it
+        # running through a demo and read it afterwards.
+        svc_start power "$(_power_cmd "$ngpu" "$interval" watch)" || return 1
+        ok "power watch running (sampling every ${interval}s across $ngpu GPU(s))"
+        note "read it:  percorso-demo logs power -f      stop:  percorso-demo stop power"
+        return 0
+    fi
+
+    printf "percorso-demo power — %s, %s GPU(s), %ss at %ss intervals\n\n" \
+           "$(hostname -s)" "$ngpu" "$dur" "$interval"
+    note "NSC kills below ${POWER_FLOOR}W moving average; we warn below ${POWER_WARN}W"
+    printf "\n"
+    local out; out=$(timeout "$dur" bash -c "$(_power_cmd "$ngpu" "$interval" summary)")
+    printf '%s\n' "$out"
+    local mean; mean=$(printf '%s' "$out" | awk -F'mean=' 'NF>1{split($2,a," ");print a[1]}' | tail -1)
+    mean="${mean%W}"
+    [ -n "$mean" ] || { warn "no samples collected"; return 1; }
+    if awk -v m="$mean" -v f="$POWER_FLOOR" 'BEGIN{exit !(m < f)}'; then
+        warn "mean ${mean}W is BELOW NSC's ${POWER_FLOOR}W floor — this job is kill-eligible"
+        _power_advice; return 1
+    elif awk -v m="$mean" -v w="$POWER_WARN" 'BEGIN{exit !(m < w)}'; then
+        warn "mean ${mean}W is under our ${POWER_WARN}W margin — thin, and the floor is rising"
+        _power_advice; return 1
+    fi
+    ok "mean ${mean}W — comfortably above the floor"
+}
+
+_power_advice() {
+    note "exempt paths, in order of preference:"
+    note "  1. a reservation — bjob 'percorso' profile sets D_RESERVATION=safe"
+    note "  2. NSC's own tool, under 8h:  interactive --gpus=1 -t 04:00:00"
+    note "  3. keep jobs under one hour (what the other profiles do)"
+    note "and: do not hold the allocation while nobody is interacting"
+}
+
+# Emitted as a shell fragment so both the one-shot and the detached watcher run
+# exactly the same sampler. nvidia-smi does its own sleeping with -l, so there is
+# no polling loop of ours to get wrong.
+_power_cmd() {
+    local ngpu="$1" interval="$2" mode="$3"
+    printf '%s' "nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits -l $interval 2>/dev/null \
+      | awk -v n=$ngpu -v mode=$mode -v floor=$POWER_FLOOR '
+          { s += \$1; c++ }
+          c % n == 0 {
+              k++; tot += s; if (s > max || k == 1) max = s; if (s < min || k == 1) min = s
+              if (mode == \"watch\")
+                  printf \"sample %d  now=%.0fW  mean=%.0fW  %s\n\", k, s, tot/k, (tot/k < floor ? \"BELOW FLOOR\" : \"ok\")
+              else
+                  printf \"  sample %d  now=%.0fW  mean=%.0fW  min=%.0fW  max=%.0fW\n\", k, s, tot/k, min, max
+              fflush(); s = 0
+          }'"
+}
+
+# ── ingest (superseded by zenoh) ──────────────────────────────────────────────
+cmd_ingest() {
+    local port="${PERCORSO_INGEST_PORT:-9000}" bg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --bg) bg=1 ;;
+            -*)   die "unknown option '$1'" ;;
+            *)    port="$1" ;;
+        esac
+        shift
+    done
+    require_job
+    printf "percorso-demo ingest — listening on %s:%s\n" "$(hostname -s)" "$port"
+    note "start this BEFORE the pipeline, so /clock and camera_info exist first"
+    note "retired: percorso-net no longer knows 'ingest' — forward it by hand with"
+    note "  ssh -O forward -L 127.0.0.1:$port:$(hostname -s):$port <user>@berzelius1.nsc.liu.se"
+    printf "\n"
+    local cmd="ros2 run percorso_perception_ros percorso_ingest_node.py --ros-args -p port:=$port"
+    if [ -n "$bg" ]; then
+        svc_start ingest "$cmd" && svc_wait_port ingest "$port" 60
+        return
+    fi
+    in_container "$cmd"
+}
+
+case "${1:-}" in
+    where|path) shift; cmd_where    "$@" ;;
+    overlay)  shift; cmd_overlay  "$@" ;;
+    zenoh)    shift; cmd_zenoh    "$@" ;;
+    ingest)   shift
+              warn "'ingest' is superseded by 'zenoh' (maintained upstream, carries all topics)"
+              note "use:  percorso-demo zenoh"
+              cmd_ingest "$@" ;;
+    doctor)   shift; cmd_doctor   "$@" ;;
+    status)   shift; cmd_status   "$@" ;;
+    power)    shift; cmd_power    "$@" ;;
+    logs|log) shift; cmd_logs     "$@" ;;
+    stop)     shift; cmd_stop     "$@" ;;
+    pipeline) shift; cmd_pipeline "$@" ;;
+    bag)      shift; cmd_bag      "$@" ;;
+    *)
+        cat <<USAGE
+percorso-demo — run the live-demo pipeline against an EGG rosbag
+
+  percorso-demo where                 print every path this tool uses
+  percorso-demo overlay               one-time: build the demo ROS overlay
+  percorso-demo doctor                verify the DEMO code is what will run
+  percorso-demo status                what is running on this node, and is it healthy
+  percorso-demo power [sec] [--watch] GPU draw vs NSC's efficiency floor
+
+  percorso-demo zenoh [--fg]          ROS-topic bridge for a remote robot  (background)
+  percorso-demo pipeline [label] [--bg]  perception + query bridge         (foreground)
+  percorso-demo bag [batch] [--loop] [--bg]  play the rosbag HERE          (foreground)
+
+  percorso-demo logs <svc> [-f|N]     tail a background service's log
+  percorso-demo stop <svc|all>        stop background services
+  percorso-demo ingest [port]         deprecated: custom HTTP ingest
+
+Services that detach write a pid + log to $RUN_DIR
+(per node — a stale pidfile from another node cannot be mistaken for a live one).
+--fg watches a background-by-default service; --bg detaches a foreground one.
+
+[label] only names the output dir (default 'live'); it is NOT a batch, because with
+zenoh the bag is on the robot. [batch] applies only to 'bag' (local replay,
+default $BATCH).
+
+typical remote-feed session, one terminal:
+  percorso-demo doctor && percorso-demo zenoh && percorso-demo pipeline
+
+this file:  $SELF
+
+env:  PERCORSO_BATCH  PERCORSO_BRIDGE_PORT  COSMOS_URL  PERCORSO_OVERLAY  PERCORSO_RUN_DIR
+USAGE
+        exit 1 ;;
+esac

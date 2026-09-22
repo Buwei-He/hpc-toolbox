@@ -1,0 +1,9 @@
+# per-machine Claude Code permission cache, not shared config
+.claude/settings.local.json
+
+# manual pre-edit backups — superseded by git commits going forward
+*.bak_*
+
+# regenerable build artifacts
+__pycache__/
+*.pyc
