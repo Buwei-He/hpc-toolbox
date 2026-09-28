@@ -41,8 +41,18 @@ fi
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "Attaching existing tmux session: $SESSION"
 else
-    tmux new-session -d -s "$SESSION" -n percorso         "PROJECT='$PROJECT' SLURMD_NODENAME='$NODE' PERCORSO_AUTOSTART='$AUTOSTART' bash '$PROFILE_DIR/enter_percorso_container.sh'"
+    # Created with a placeholder shell first, and remain-on-exit set BEFORE the
+    # real payload runs (send-keys, not part of new-session's own command) --
+    # otherwise a fast doctor failure (e.g. AUTOSTART racing the cosmos URL file
+    # right after that job's own boot, or an NFS attribute-cache lag on a
+    # freshly mounted container) exits the pane before remain-on-exit could take
+    # effect, tmux destroys the session for having zero panes left, and there is
+    # then no shell anywhere to retry in -- discovered when this happened twice
+    # in a row on 2026-09-22, forcing a full job resubmit each time.
+    tmux new-session -d -s "$SESSION" -n percorso
     tmux set-option -t "$SESSION" history-limit 50000 >/dev/null 2>&1 || true
+    tmux set-window-option -t "$SESSION:percorso" remain-on-exit on >/dev/null 2>&1 || true
+    tmux send-keys -t "$SESSION:percorso"         "PROJECT='$PROJECT' SLURMD_NODENAME='$NODE' PERCORSO_AUTOSTART='$AUTOSTART' bash '$PROFILE_DIR/enter_percorso_container.sh'" Enter
     echo "Started tmux session: $SESSION"
 fi
 

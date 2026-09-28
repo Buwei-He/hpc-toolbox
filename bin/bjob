@@ -842,6 +842,17 @@ cmd_submit() {
         [[ -n "${D_CONSTRAINT:-}" ]] && printf '#SBATCH --constraint=%s\n' "$D_CONSTRAINT"
         printf '#SBATCH --output=%s/%s-%%j.log\n' "$log_dir" "$name"
         printf 'cd "%s"\n[[ -f ~/.bashrc ]] && source ~/.bashrc\n' "$PROJECT"
+        # Forward PERCORSO_* from the submitting shell explicitly, so a
+        # startup-time choice (e.g. PERCORSO_COSMOS=nano bjob submit percorso)
+        # reaches setup.sh reliably. Without this it only worked by accident,
+        # riding on sbatch's default environment inheritance -- fine until
+        # some other flag or site config changes that default; explicit here
+        # means it is visible in the generated script and in the job's own
+        # launch log, not a behavior nobody wrote down.
+        local var
+        for var in "${!PERCORSO_@}"; do
+            printf 'export %s=%q\n' "$var" "${!var}"
+        done
         printf 'source "%s"\n' "$JOBS_DIR/$name/setup.sh"
         [[ -n "${D_POWER_GUARD:-}" ]] && printf 'bash "%s" __power-guard-start\n' "$SCRIPT_DIR/bjob"
         # setup.sh already backgrounded the real work and returned; this just
