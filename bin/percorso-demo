@@ -566,6 +566,18 @@ cmd_ask_snapshot() {
         "python3 '$ASK_SNAPSHOT_TOOL' $loc_arg --cosmos-url '$cu' --cosmos-model '$cosmos_jobname'"
 }
 
+# ── exec ────────────────────────────────────────────────────────────────────
+# Run an arbitrary command inside the demo container env (ROS sourced, DEMO_LIB
+# prepended to PYTHONPATH ahead of the paper worktree) — for one-off scripts or
+# analysis runs that aren't worth their own subcommand (e.g. scripts/
+# demo_query_batch.py against a saved fixture). Requires a running job; does
+# not start or touch the live pipeline itself.
+cmd_exec() {
+    local cmd="${1:?exec needs a command string, e.g.: percorso-demo exec \"python3 foo.py\"}"
+    require_job
+    in_container "$cmd"
+}
+
 # ── logs / stop ───────────────────────────────────────────────────────────────
 cmd_logs() {
     local name="${1:-}" lf
@@ -1092,6 +1104,7 @@ case "${1:-}" in
     doctor)   shift; cmd_doctor   "$@" ;;
     status)   shift; cmd_status   "$@" ;;
     ask)      shift; cmd_ask      "$@" ;;
+    exec)     shift; cmd_exec     "$@" ;;
     power)    shift; cmd_power    "$@" ;;
     logs|log) shift; cmd_logs     "$@" ;;
     stop)     shift; cmd_stop     "$@" ;;
@@ -1107,6 +1120,7 @@ percorso-demo — run the live-demo pipeline: mock test (recorded bag) or real d
 
   percorso-demo ask "<q>" --snapshot DIR|--latest BATCH   ask about one saved snapshot — the real thing
   percorso-demo ask "<question>"      (no --snapshot/--latest) debug-only: whatever is live right now
+  percorso-demo exec "<cmd>"          run a command in the demo container env (ROS + PYTHONPATH set)
   percorso-demo status                what is running on this node, and is it healthy
   percorso-demo where                 print every path this tool uses
   percorso-demo overlay               one-time: build the demo ROS overlay
