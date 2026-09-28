@@ -10,13 +10,22 @@
 # demo path. Run this INSIDE a SLURM job on a compute node.
 #
 #   percorso-demo doctor              verify the demo code is what will actually run
-#   percorso-demo run bag [batch] [--snapshot[=N]] [--cosmos reason2|nano]  mock test
-#   percorso-demo run live [--snapshot[=N]] [--cosmos reason2|nano]        real demo
-#     --snapshot[=N]: also poll the query bridge every N sec (default 30) and
+#   percorso-demo run bag [batch] [--snapshot[=N]] [--no-camera-preview] [--cosmos reason2|nano] [--voice-router]  mock test
+#   percorso-demo run live [--snapshot[=N]] [--no-camera-preview] [--cosmos reason2|nano] [--voice-router]        real demo
+#     --voice-router: enable POST /ask (agent picks dsg/interactions/events/video itself); off by default
+#     --snapshot[=N]: also poll the query bridge every N sec (default 10) and
 #     write dsg.json/events.yaml snapshots — see tools/snapshot_poller.py.
+#     Snapshots include the newest human_clips/ clip (camera + track-box
+#     overlay) by default, so the Rerun exporter can show it next to the
+#     scene graph — pass --no-camera-preview for a smaller/faster snapshot
+#     with no camera pane instead.
 #     --cosmos: which HOI reasoning backend to query (default reason2) —
 #     'reason2' = cosmos-reason2 job (port 8000), 'nano' = cosmos3-nano-reasoner
 #     job (port 8001). Either must already be running (bjob submit <profile>).
+#     Also settable at job-submit time (AUTOSTART never passes --cosmos, so
+#     this is how it picks a backend): PERCORSO_COSMOS=nano bjob submit percorso
+#   percorso-demo ask "<question>" --snapshot <dir>|--latest <batch>   ask about ONE saved snapshot
+#   percorso-demo ask "<question>"    (no --snapshot/--latest) debug-only: whatever is live RIGHT NOW
 #   percorso-demo status              what is running on THIS node, and is it healthy
 #   percorso-demo where               print the paths this tool uses
 #   percorso-demo overlay             one-time: build the demo ROS overlay
@@ -83,6 +92,7 @@ RUN_DIR="${PERCORSO_RUN_DIR:-$PROJECT/.percorso/run/$(hostname -s)}"
 # in the toolbox's own .percorso/ state directory.
 SNAPSHOT_DIR="${PERCORSO_SNAPSHOT_DIR:-${DEMO_LIB%/src}/output/snapshot}"
 SNAPSHOT_POLLER="${PERCORSO_SNAPSHOT_POLLER:-$PROJECT/ros2_ws/src/percorso-perception/tools/snapshot_poller.py}"
+ASK_SNAPSHOT_TOOL="${PERCORSO_ASK_SNAPSHOT_TOOL:-$PROJECT/ros2_ws/src/percorso-perception/tools/ask_snapshot.py}"
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' DIM='\033[2m' NC='\033[0m'
 ok()   { printf "${G}  ok${NC}    %s\n" "$*"; }
@@ -148,8 +158,8 @@ require_job() {
 # jobs/cosmos-reason2/setup.sh and jobs/cosmos3-nano-reasoner/setup.sh.
 cosmos_backend_spec() {
     case "${1:-${PERCORSO_COSMOS:-reason2}}" in
-        reason2) printf '%s\t%s/.cosmos_url\t8000' cosmos-reason2 "$PROJECT" ;;
-        nano)    printf '%s\t%s/.cosmos3_url\t8001' cosmos3-nano-reasoner "$PROJECT" ;;
+        reason2) printf '%s\t%s/.cosmos_url\t8000\n' cosmos-reason2 "$PROJECT" ;;
+        nano)    printf '%s\t%s/.cosmos3_url\t8001\n' cosmos3-nano-reasoner "$PROJECT" ;;
         *)       die "unknown cosmos backend '$1'" "use 'reason2' or 'nano'" ;;
     esac
 }
@@ -460,6 +470,102 @@ cmd_status() {
     note "from the laptop:  ssh-helper connect <node> stream && ssh-helper connect <node> bridge"
 }
 
+# ── ask ───────────────────────────────────────────────────────────────────────
+# The actual point of the demo: querying what was really seen, not previewing
+# a snapshot after the fact. Two modes:
+#   percorso-demo ask "<question>" --snapshot <dir> | --latest <batch>
+#     The real demo path: ask about ONE specific already-captured snapshot
+#     (the same one a visitor is looking at in the Rerun viewer). Delegates
+#     to tools/ask_snapshot.py — needs the full container (openai client,
+#     daaam package), same as tools/viewer/load_snapshot.py.
+#   percorso-demo ask "<question>"   (no --snapshot/--latest)
+#     Debug-only: hits the live bridge, always answering about whatever is in
+#     the rolling buffer *right now*. Fine for checking the pipeline is
+#     alive; not useful for a live demo where "now" keeps moving under you.
+#     Plain HTTP, no container needed (same reason doctor/status's own curl
+#     checks don't need one either).
+cmd_ask() {
+    local question="" snapshot_dir="" latest_batch=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --snapshot|--snapshot-dir) snapshot_dir="${2:?$1 needs a directory}"; shift ;;
+            --latest)                  latest_batch="${2:?--latest needs a batch name}"; shift ;;
+            -*) die "unknown option '$1'" 'ask "<question>" [--snapshot DIR | --latest BATCH]' ;;
+            *)  question="$1" ;;
+        esac
+        shift
+    done
+    [ -n "$question" ] || die "ask needs a question" 'ask "<question>" [--snapshot DIR | --latest BATCH]'
+
+    if [ -n "$snapshot_dir" ] || [ -n "$latest_batch" ]; then
+        cmd_ask_snapshot "$question" "$snapshot_dir" "$latest_batch"
+        return
+    fi
+
+    require_job
+    local bridge_url="http://127.0.0.1:$BRIDGE_PORT"
+    printf "percorso-demo ask — %s (live/debug mode — use --snapshot or --latest for the real thing)\n" "$(hostname -s)"
+    note "Q: $question"
+    printf "\n"
+    python3 - "$bridge_url" "$question" <<'PYEOF'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+base_url, question = sys.argv[1], sys.argv[2]
+body = json.dumps({"question": question}).encode()
+req = urllib.request.Request(
+    f"{base_url}/recent_video/ask", data=body,
+    headers={"Content-Type": "application/json"}, method="POST",
+)
+try:
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        result = json.load(resp)
+except urllib.error.URLError as exc:
+    print(f"request failed: {exc}")
+    sys.exit(1)
+
+if result.get("error"):
+    print(f"error: {result['error']}")
+    sys.exit(1)
+
+print(f"A: {result.get('answer')}\n")
+print(
+    f"window: {result.get('window_sec')}s ({result.get('frame_count')} frames)   "
+    f"elapsed: {result.get('elapsed_sec')}s"
+)
+interactions = result.get("extracted_interactions") or []
+if interactions:
+    print(f"extracted_interactions ({len(interactions)}):")
+    for item in interactions:
+        print(f"  - {item}")
+PYEOF
+}
+
+cmd_ask_snapshot() {
+    local question="$1" snapshot_dir="$2" latest_batch="$3"
+    require_job
+    [ -f "$ASK_SNAPSHOT_TOOL" ] || die "no tool at $ASK_SNAPSHOT_TOOL"
+    local cu; cu=$(cosmos_url)
+    [ -n "$cu" ] || die "no cosmos URL" "start cosmos first (bjob submit cosmos-reason2|cosmos3-nano-reasoner)"
+    local cosmos_jobname cosmos_urlfile cosmos_port
+    IFS=$'\t' read -r cosmos_jobname cosmos_urlfile cosmos_port < <(cosmos_backend_spec)
+
+    local loc_arg
+    if [ -n "$snapshot_dir" ]; then loc_arg="--snapshot-dir '$snapshot_dir'"; else loc_arg="--latest '$latest_batch'"; fi
+
+    printf "percorso-demo ask — %s (snapshot mode)\n" "$(hostname -s)"
+    note "Q: $question"
+    note "cosmos: $cu (model: $cosmos_jobname)"
+    printf "\n"
+    # Question travels via env var, not shell-interpolated into the command
+    # string: a free-form question is very likely to contain an apostrophe
+    # ("what's happening?"), which naive single-quoting would break on.
+    PERCORSO_ASK_QUESTION="$question" in_container \
+        "python3 '$ASK_SNAPSHOT_TOOL' $loc_arg --cosmos-url '$cu' --cosmos-model '$cosmos_jobname'"
+}
+
 # ── logs / stop ───────────────────────────────────────────────────────────────
 cmd_logs() {
     local name="${1:-}" lf
@@ -504,9 +610,25 @@ cmd_pipeline() {
     require_job
     local cu; cu=$(cosmos_url)
     [ -n "$cu" ] || die "no cosmos URL" "start cosmos first (bjob submit cosmos-reason2|cosmos3-nano-reasoner), or export COSMOS_URL=http://<node>:<port>/v1"
+    # The served model name, not just the URL: vLLM validates the OpenAI
+    # `model` field against --served-model-name and 404s on a mismatch, so
+    # switching --cosmos without also switching this would silently break
+    # every query against the nano backend. Job name and served name are the
+    # same string by convention in both profiles' setup.sh (see
+    # jobs/{cosmos-reason2,cosmos3-nano-reasoner}/setup.sh's
+    # --served-model-name), so cosmos_backend_spec's first field already IS
+    # the right model name.
+    local cosmos_jobname cosmos_urlfile cosmos_port
+    IFS=$'\t' read -r cosmos_jobname cosmos_urlfile cosmos_port < <(cosmos_backend_spec)
+
+    local voice_router_arg=""
+    if [ -n "${PERCORSO_VOICE_ROUTER:-}" ]; then
+        voice_router_arg="enable_live_query_router:=true"
+        note "voice router: on (POST /ask picks dsg/interactions/events/video itself)"
+    fi
 
     printf "percorso-demo pipeline — run '%s' on %s\n" "$label" "$(hostname -s)"
-    note "cosmos:  $cu (backend: ${PERCORSO_COSMOS:-reason2})"
+    note "cosmos:  $cu (backend: ${PERCORSO_COSMOS:-reason2}, model: $cosmos_jobname)"
     note "bridge:  http://$(hostname -s):$BRIDGE_PORT"
     note "frames: percorso-demo stream (remote robot), or bag (local)"
     note "from your laptop:  ssh-helper connect <node> bridge"
@@ -528,6 +650,7 @@ cmd_pipeline() {
           save_human_clips:=true \
           enable_cosmos_hoi_processing:=true \
           cosmos_hoi_base_url:='$cu' \
+          cosmos_hoi_model:='$cosmos_jobname' \
           cosmos_hoi_media_root:='$PROJECT' \
           defer_dsg_processing:=false \
           enable_live_hoi_query:=true \
@@ -535,11 +658,17 @@ cmd_pipeline() {
           live_bridge_port:=$BRIDGE_PORT \
           enable_live_event_refresh:=true \
           event_refresh_interval_sec:=120.0 \
-          output_run_prefix:=demo_${label}_"
+          output_run_prefix:=demo_${label}_ \
+          $voice_router_arg"
     [ -n "$ODOM_FRAME" ]   && cmd="$cmd odom_frame:='$ODOM_FRAME'"
     [ -n "$SENSOR_FRAME" ] && cmd="$cmd sensor_frame:='$SENSOR_FRAME'"
     if [ -n "$ODOM_FRAME$SENSOR_FRAME" ]; then
         note "frame override: odom_frame=${ODOM_FRAME:-<launch default>} sensor_frame=${SENSOR_FRAME:-<launch default>}"
+    fi
+    if [ -n "${HYDRA_INPUT_CONFIG:-}" ]; then
+        [ -f "$HYDRA_INPUT_CONFIG" ] || die "input config not found: $HYDRA_INPUT_CONFIG"
+        cmd="$cmd input_config_path:='$HYDRA_INPUT_CONFIG'"
+        note "input config: $HYDRA_INPUT_CONFIG"
     fi
 
     if [ -z "$bg" ]; then
@@ -600,31 +729,44 @@ cmd_bag() {
 # below still exist for manual control (debugging, a non-default batch mid-run,
 # scripting).
 cmd_run() {
-    local usage="run takes: bag [batch] [--loop] [--snapshot[=N]] [--cosmos reason2|nano] | live [--bg] [--snapshot[=N]] [--cosmos reason2|nano]"
+    local usage="run takes: bag [batch] [--loop] [--snapshot[=N]] [--no-camera-preview] [--cosmos reason2|nano] [--voice-router] | live [--bg] [--snapshot[=N]] [--no-camera-preview] [--cosmos reason2|nano] [--voice-router]"
     local mode="${1:?$usage}"; shift
-    local batch="$BATCH" loop="" bg="" snapshot_interval=""
+    # Camera preview is on by default (forwarded to cmd_snapshot, which
+    # defaults to it too) -- --no-camera-preview opts out.
+    local batch="$BATCH" loop="" bg="" snapshot_interval="" camera_preview=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --snapshot)   snapshot_interval=30 ;;
-            --snapshot=*) snapshot_interval="${1#--snapshot=}" ;;
-            --loop)       loop="--loop" ;;
-            --bg)         bg=1 ;;
-            --cosmos)     PERCORSO_COSMOS="${2:?--cosmos needs reason2 or nano}"; shift ;;
-            --cosmos=*)   PERCORSO_COSMOS="${1#--cosmos=}" ;;
-            -*)           die "unknown option '$1'" "$usage" ;;
-            *)            batch="$1" ;;
+            --snapshot)          snapshot_interval=10 ;;
+            --snapshot=*)        snapshot_interval="${1#--snapshot=}" ;;
+            --camera-preview)    : ;;  # already the default; accepted for backward compat
+            --no-camera-preview) camera_preview="--no-camera-preview" ;;
+            --loop)              loop="--loop" ;;
+            --bg)                bg=1 ;;
+            --cosmos)            PERCORSO_COSMOS="${2:?--cosmos needs reason2 or nano}"; shift ;;
+            --cosmos=*)          PERCORSO_COSMOS="${1#--cosmos=}" ;;
+            # Off by default: POST /ask loads a tool-calling agent (CLIP + sentence
+            # embedding models) at pipeline startup, an unverified-live code path.
+            --voice-router)      PERCORSO_VOICE_ROUTER=1 ;;
+            -*)                  die "unknown option '$1'" "$usage" ;;
+            *)                   batch="$1" ;;
         esac
         shift
     done
     cosmos_backend_spec "${PERCORSO_COSMOS:-}" >/dev/null
     export PERCORSO_COSMOS="${PERCORSO_COSMOS:-reason2}"
+    export PERCORSO_VOICE_ROUTER="${PERCORSO_VOICE_ROUTER:-}"
 
     case "$mode" in
         bag)
             note "run bag — mock test against '$batch', no robot needed"
             cmd_pipeline "$batch" --bg || return 1
             if [ -n "$snapshot_interval" ]; then
-                cmd_snapshot --interval "$snapshot_interval" --out "$SNAPSHOT_DIR/$batch" || return 1
+                # Always fresh, never reused: svc_start no-ops on an already-
+                # running service, so a second 'run bag ... --snapshot' would
+                # otherwise keep polling with WHATEVER --interval/--out the
+                # first invocation used, silently ignoring this one's flags.
+                svc_stop snapshot >/dev/null 2>&1
+                cmd_snapshot --interval "$snapshot_interval" --out "$SNAPSHOT_DIR/$batch" $camera_preview || return 1
             fi
             cmd_bag "$batch" $loop
             ;;
@@ -635,12 +777,23 @@ cmd_run() {
             SENSOR_FRAME="${PERCORSO_SENSOR_FRAME:-odin1_camera_0}"
             note "frames: odom=$ODOM_FRAME sensor=$SENSOR_FRAME"
             note "(override with PERCORSO_ODOM_FRAME / PERCORSO_SENSOR_FRAME if ARI's own frames differ)"
+            # egg_dataset_input_config.yaml's extrinsics.robot_frame (os1) is
+            # independent of the sensor_frame/robot_frame launch args above --
+            # see tools/STATE.md's "Must-knows" -- so a live run needs its own
+            # input_config_path pointing at ari_dataset_input_config.yaml
+            # (robot_frame: odin1_camera_0) instead. A demo-worktree-absolute
+            # path, not $(find-pkg-share ...): unambiguous, and never risks
+            # resolving through the wrong overlay the way that substitution did
+            # once before (same file's own comment, above).
+            HYDRA_INPUT_CONFIG="${PERCORSO_HYDRA_INPUT_CONFIG:-$DEMO_ROS/config/hydra_ros_config/ari_dataset_input_config.yaml}"
             if [ -n "$snapshot_interval" ]; then
                 # Started before the bridge is confirmed up on purpose: a
                 # foreground pipeline blocks this shell, so there is no "after
                 # it's ready" moment to hook. The poller's own retry loop
                 # already tolerates a bridge that isn't answering yet.
-                cmd_snapshot --interval "$snapshot_interval" || return 1
+                # Always fresh — see the matching comment in the bag branch.
+                svc_stop snapshot >/dev/null 2>&1
+                cmd_snapshot --interval "$snapshot_interval" $camera_preview || return 1
             fi
             if [ -n "$bg" ]; then cmd_pipeline --bg; else cmd_pipeline; fi
             ;;
@@ -697,23 +850,29 @@ cmd_stream() {
 # visualizes any snapshot directory unmodified. Usually started for you by
 # 'run bag|live --snapshot[=N]', not called directly.
 cmd_snapshot() {
-    local interval=30 out="$SNAPSHOT_DIR/live" fg=""
+    # Camera preview is on by default -- --no-camera-preview opts out for a
+    # smaller/faster snapshot with no camera pane.
+    # camera_preview empty by default: the poller already defaults to it,
+    # nothing needs to be passed -- only --no-camera-preview overrides.
+    local interval=10 out="$SNAPSHOT_DIR/live" fg="" camera_preview="" camera_preview_note=" (+ camera preview)"
     while [ $# -gt 0 ]; do
         case "$1" in
-            --interval) interval="${2:?--interval needs seconds}"; shift ;;
-            --out)      out="${2:?--out needs a path}"; shift ;;
-            --fg)       fg=1 ;;
-            --bg)       fg="" ;;
-            *) die "unknown option '$1'" "snapshot [--interval N] [--out DIR] [--fg]" ;;
+            --interval)          interval="${2:?--interval needs seconds}"; shift ;;
+            --out)               out="${2:?--out needs a path}"; shift ;;
+            --fg)                fg=1 ;;
+            --bg)                fg="" ;;
+            --camera-preview)    : ;;  # already the default; accepted for backward compat
+            --no-camera-preview) camera_preview="--no-camera-preview"; camera_preview_note="" ;;
+            *) die "unknown option '$1'" "snapshot [--interval N] [--out DIR] [--fg] [--no-camera-preview]" ;;
         esac
         shift
     done
     require_job
     [ -f "$SNAPSHOT_POLLER" ] || die "no poller at $SNAPSHOT_POLLER"
 
-    local cmd="python3 '$SNAPSHOT_POLLER' --base-url http://127.0.0.1:$BRIDGE_PORT --interval $interval --out '$out'"
+    local cmd="python3 '$SNAPSHOT_POLLER' --base-url http://127.0.0.1:$BRIDGE_PORT --interval $interval --out '$out' $camera_preview"
 
-    printf "percorso-demo snapshot — every %ss -> %s\n" "$interval" "$out"
+    printf "percorso-demo snapshot — every %ss -> %s%s\n" "$interval" "$out" "$camera_preview_note"
 
     if [ -n "$fg" ]; then in_container "$cmd"; return; fi
     # Nothing to probe: a poller opens no port. Report the pid and move on —
@@ -932,6 +1091,7 @@ case "${1:-}" in
     netcheck) shift; cmd_netcheck "$@" ;;
     doctor)   shift; cmd_doctor   "$@" ;;
     status)   shift; cmd_status   "$@" ;;
+    ask)      shift; cmd_ask      "$@" ;;
     power)    shift; cmd_power    "$@" ;;
     logs|log) shift; cmd_logs     "$@" ;;
     stop)     shift; cmd_stop     "$@" ;;
@@ -942,9 +1102,11 @@ case "${1:-}" in
 percorso-demo — run the live-demo pipeline: mock test (recorded bag) or real demo (robot)
 
   percorso-demo doctor                verify the DEMO code is what will run
-  percorso-demo run bag [batch] [--loop] [--snapshot[=N]] [--cosmos reason2|nano]   mock test, one command
-  percorso-demo run live [--bg] [--snapshot[=N]] [--cosmos reason2|nano]            real demo, one command
+  percorso-demo run bag [batch] [--loop] [--snapshot[=N]] [--no-camera-preview] [--cosmos reason2|nano] [--voice-router]   mock test, one command
+  percorso-demo run live [--bg] [--snapshot[=N]] [--no-camera-preview] [--cosmos reason2|nano] [--voice-router]            real demo, one command
 
+  percorso-demo ask "<q>" --snapshot DIR|--latest BATCH   ask about one saved snapshot — the real thing
+  percorso-demo ask "<question>"      (no --snapshot/--latest) debug-only: whatever is live right now
   percorso-demo status                what is running on this node, and is it healthy
   percorso-demo where                 print every path this tool uses
   percorso-demo overlay               one-time: build the demo ROS overlay
@@ -960,7 +1122,7 @@ mid-run batch swap, debugging, scripting):
   percorso-demo stream [--fg]                    raw TCP push receiver     (background)
   percorso-demo pipeline [label] [--bg]          perception + query bridge (foreground)
   percorso-demo bag [batch] [--loop] [--bg]      play the rosbag HERE      (foreground)
-  percorso-demo snapshot [--interval N] [--out DIR]  periodic dsg.json/events.yaml capture (background)
+  percorso-demo snapshot [--interval N] [--out DIR] [--no-camera-preview]  periodic dsg.json/events.yaml capture (background)
 
 Services that detach write a pid + log to $RUN_DIR
 (per node — a stale pidfile from another node cannot be mistaken for a live one).
