@@ -668,8 +668,6 @@ cmd_pipeline() {
           enable_live_hoi_query:=true \
           live_buffer_sec:=30.0 \
           live_bridge_port:=$BRIDGE_PORT \
-          enable_live_event_refresh:=true \
-          event_refresh_interval_sec:=120.0 \
           output_run_prefix:=demo_${label}_ \
           $voice_router_arg"
     [ -n "$ODOM_FRAME" ]   && cmd="$cmd odom_frame:='$ODOM_FRAME'"
