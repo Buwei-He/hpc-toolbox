@@ -681,6 +681,13 @@ cmd_pipeline() {
     if [ -n "$ODOM_FRAME$SENSOR_FRAME" ]; then
         note "frame override: odom_frame=${ODOM_FRAME:-<launch default>} sensor_frame=${SENSOR_FRAME:-<launch default>}"
     fi
+    # Extra launch arguments, appended as given, for opt-in node options (e.g.
+    # captioner:=cosmos, or the Pass 1 latency ones: cosmos_hoi_pass1_input:=stream).
+    # Empty by default, which launches exactly as before.
+    if [ -n "${PERCORSO_LAUNCH_EXTRA:-}" ]; then
+        cmd="$cmd $PERCORSO_LAUNCH_EXTRA"
+        note "extra launch args: $PERCORSO_LAUNCH_EXTRA"
+    fi
     if [ -n "${HYDRA_INPUT_CONFIG:-}" ]; then
         [ -f "$HYDRA_INPUT_CONFIG" ] || die "input config not found: $HYDRA_INPUT_CONFIG"
         cmd="$cmd input_config_path:='$HYDRA_INPUT_CONFIG'"
