@@ -156,10 +156,15 @@ require_job() {
 # (default reason2, or $PERCORSO_COSMOS). Each writes its own URL file so
 # both jobs can be up at once without clobbering each other — see
 # jobs/cosmos-reason2/setup.sh and jobs/cosmos3-nano-reasoner/setup.sh.
+# Fields: job/served-model name, URL file, port, HOI video sampling mode.
+# The 4th field is the daaam `cosmos_hoi_video_sampling` the server accepts:
+# the nano profile's vLLM 0.27.1 rejects the "processor" mode's
+# mm_processor_kwargs video request (400 "Failed to apply Qwen3VLProcessor"),
+# so every HOI clip silently failed on it; "loader_and_processor" works there.
 cosmos_backend_spec() {
     case "${1:-${PERCORSO_COSMOS:-reason2}}" in
-        reason2) printf '%s\t%s/.cosmos_url\t8000\n' cosmos-reason2 "$PROJECT" ;;
-        nano)    printf '%s\t%s/.cosmos3_url\t8001\n' cosmos3-nano-reasoner "$PROJECT" ;;
+        reason2) printf '%s\t%s/.cosmos_url\t8000\tprocessor\n' cosmos-reason2 "$PROJECT" ;;
+        nano)    printf '%s\t%s/.cosmos3_url\t8001\tloader_and_processor\n' cosmos3-nano-reasoner "$PROJECT" ;;
         *)       die "unknown cosmos backend '$1'" "use 'reason2' or 'nano'" ;;
     esac
 }
@@ -167,7 +172,7 @@ cosmos_backend_spec() {
 cosmos_url() {
     if [ -n "${COSMOS_URL:-}" ]; then printf '%s' "$COSMOS_URL"; return; fi
     local jobname urlfile port
-    IFS=$'\t' read -r jobname urlfile port < <(cosmos_backend_spec) || return 1
+    IFS=$'\t' read -r jobname urlfile port _sampling < <(cosmos_backend_spec) || return 1
     [ -s "$urlfile" ] && tr -d '\n' < "$urlfile"
 }
 
@@ -177,7 +182,7 @@ cosmos_url() {
 cosmos_node() {
     command -v squeue >/dev/null 2>&1 || return 1
     local jobname urlfile port
-    IFS=$'\t' read -r jobname urlfile port < <(cosmos_backend_spec) || return 1
+    IFS=$'\t' read -r jobname urlfile port _sampling < <(cosmos_backend_spec) || return 1
     squeue -u "$USER" -h -o "%j|%T|%N" 2>/dev/null \
       | awk -F'|' -v j="$jobname" '$1==j && $2=="RUNNING" && $3!="" {print $3; exit}'
 }
@@ -188,7 +193,7 @@ cosmos_node() {
 # is instead of just "not answering".
 cosmos_diagnose() {
     local url="$1" host node jobname urlfile port
-    IFS=$'\t' read -r jobname urlfile port < <(cosmos_backend_spec)
+    IFS=$'\t' read -r jobname urlfile port _sampling < <(cosmos_backend_spec)
     host=${url#*://}; host=${host%%:*}
     if node=$(cosmos_node) && [ -n "$node" ]; then
         if [ "$node" != "$host" ]; then
@@ -393,7 +398,7 @@ cmd_doctor() {
         fi
     else
         local jobname urlfile port
-        IFS=$'\t' read -r jobname urlfile port < <(cosmos_backend_spec)
+        IFS=$'\t' read -r jobname urlfile port _sampling < <(cosmos_backend_spec)
         warn "no cosmos URL — $urlfile is missing"
         note "start it:  bjob submit $jobname"
         fails=$((fails+1))
@@ -550,7 +555,7 @@ cmd_ask_snapshot() {
     local cu; cu=$(cosmos_url)
     [ -n "$cu" ] || die "no cosmos URL" "start cosmos first (bjob submit cosmos-reason2|cosmos3-nano-reasoner)"
     local cosmos_jobname cosmos_urlfile cosmos_port
-    IFS=$'\t' read -r cosmos_jobname cosmos_urlfile cosmos_port < <(cosmos_backend_spec)
+    IFS=$'\t' read -r cosmos_jobname cosmos_urlfile cosmos_port cosmos_sampling < <(cosmos_backend_spec)
 
     local loc_arg
     if [ -n "$snapshot_dir" ]; then loc_arg="--snapshot-dir '$snapshot_dir'"; else loc_arg="--latest '$latest_batch'"; fi
@@ -631,7 +636,7 @@ cmd_pipeline() {
     # --served-model-name), so cosmos_backend_spec's first field already IS
     # the right model name.
     local cosmos_jobname cosmos_urlfile cosmos_port
-    IFS=$'\t' read -r cosmos_jobname cosmos_urlfile cosmos_port < <(cosmos_backend_spec)
+    IFS=$'\t' read -r cosmos_jobname cosmos_urlfile cosmos_port cosmos_sampling < <(cosmos_backend_spec)
 
     local voice_router_arg=""
     if [ -n "${PERCORSO_VOICE_ROUTER:-}" ]; then
@@ -640,7 +645,7 @@ cmd_pipeline() {
     fi
 
     printf "percorso-demo pipeline — run '%s' on %s\n" "$label" "$(hostname -s)"
-    note "cosmos:  $cu (backend: ${PERCORSO_COSMOS:-reason2}, model: $cosmos_jobname)"
+    note "cosmos:  $cu (backend: ${PERCORSO_COSMOS:-reason2}, model: $cosmos_jobname, video sampling: $cosmos_sampling)"
     note "bridge:  http://$(hostname -s):$BRIDGE_PORT"
     note "frames: percorso-demo stream (remote robot), or bag (local)"
     note "from your laptop:  ssh-helper connect <node> bridge"
@@ -663,6 +668,7 @@ cmd_pipeline() {
           enable_cosmos_hoi_processing:=true \
           cosmos_hoi_base_url:='$cu' \
           cosmos_hoi_model:='$cosmos_jobname' \
+          cosmos_hoi_video_sampling:='$cosmos_sampling' \
           cosmos_hoi_media_root:='$PROJECT' \
           defer_dsg_processing:=false \
           enable_live_hoi_query:=true \
