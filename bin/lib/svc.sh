@@ -104,7 +104,10 @@ svc_stop() {
         return 0
     fi
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-    for ((i = 0; i < 10; i++)); do
+    # The pipeline writes dsg.json and captions its last aggregated batch on SIGTERM;
+    # a KILL after 5 s used to lose both. Wait up to SVC_STOP_GRACE_SEC (default 90).
+    local grace="${SVC_STOP_GRACE_SEC:-90}"
+    for ((i = 0; i < grace * 2; i++)); do
         svc_pid "$name" >/dev/null || { ok "$name stopped"; return 0; }
         sleep 0.5
     done
