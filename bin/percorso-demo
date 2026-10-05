@@ -664,6 +664,7 @@ cmd_pipeline() {
           depth_scale:=1000.0 \
           exit_after_clock:=false \
           verbosity:=1 \
+          sigterm_timeout:=180 sigkill_timeout:=30 \
           save_human_clips:=true \
           enable_cosmos_hoi_processing:=true \
           cosmos_hoi_base_url:='$cu' \

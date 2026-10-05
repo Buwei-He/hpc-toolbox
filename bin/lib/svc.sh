@@ -103,11 +103,20 @@ svc_stop() {
         note "$name is not running"
         return 0
     fi
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-    # The pipeline writes dsg.json and captions its last aggregated batch on SIGTERM;
-    # a KILL after 5 s used to lose both. Wait up to SVC_STOP_GRACE_SEC (default 90).
-    local grace="${SVC_STOP_GRACE_SEC:-90}"
+    # Graceful first: SIGINT to the launcher only. `ros2 launch` forwards it to its
+    # nodes and escalates on its own clock (sigterm_timeout / sigkill_timeout launch
+    # arguments); a TERM to the whole group would hit daaam_node.py directly and skip
+    # the shutdown that writes dsg.json and captions the last aggregated batch.
+    # Wait up to SVC_STOP_GRACE_SEC (default 240 s) before the group TERM / KILL.
+    kill -INT "$pid" 2>/dev/null
+    local grace="${SVC_STOP_GRACE_SEC:-240}"
     for ((i = 0; i < grace * 2; i++)); do
+        svc_pid "$name" >/dev/null || { ok "$name stopped"; return 0; }
+        sleep 0.5
+    done
+    warn "$name did not exit within ${grace}s of SIGINT — sending TERM to the group"
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    for ((i = 0; i < 10; i++)); do
         svc_pid "$name" >/dev/null || { ok "$name stopped"; return 0; }
         sleep 0.5
     done
