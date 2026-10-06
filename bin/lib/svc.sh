@@ -90,6 +90,25 @@ svc_wait_port() {
     return 1
 }
 
+# Waits until a service's log contains a line matching an extended regex
+# (grep -E); fails if the service exits first or the line never appears.
+svc_wait_log() {
+    local name="$1" pattern="$2" tries="${3:-60}" i lf
+    lf=$(svc_logfile "$name")
+    for ((i = 0; i < tries; i++)); do
+        if ! svc_pid "$name" >/dev/null; then
+            warn "$name exited before printing '$pattern'"
+            svc_log_tail "$name" 15
+            return 1
+        fi
+        [ -s "$lf" ] && grep -qE -- "$pattern" "$lf" && return 0
+        sleep 1
+    done
+    warn "$name is running but has not printed '$pattern' after ${tries}s"
+    svc_log_tail "$name" 15
+    return 1
+}
+
 svc_log_tail() {
     local lf; lf=$(svc_logfile "$1")
     [ -s "$lf" ] || { note "log is empty ($lf)"; return 0; }

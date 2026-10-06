@@ -792,6 +792,13 @@ cmd_run() {
         bag)
             note "run bag — mock test against '$batch', no robot needed"
             cmd_pipeline "$batch" --bg || return 1
+            # The bridge port only says the DAAAM node is up. Hydra needs ~90 s
+            # more (label-space config load) and only then subscribes; a bag
+            # started on the bridge port alone lost its first ~70 s to Hydra
+            # on every EGG batch (experiments/khronos-baseline, 2026-10-06).
+            note "waiting for Hydra to ask for CameraInfo (its startup takes ~90 s)"
+            svc_wait_log pipeline "Waiting for CameraInfo on" 300 || return 1
+            ok "Hydra ready — playing the bag"
             if [ -n "$snapshot_interval" ]; then
                 # Always fresh, never reused: svc_start no-ops on an already-
                 # running service, so a second 'run bag ... --snapshot' would
