@@ -666,6 +666,9 @@ cmd_pipeline() {
     # the job's cores. Measured 2026-10-06 (experiments/pipeline-speed): BoT-SORT ReID
     # 1.7 s/frame under that contention vs 57 ms capped; live node 588 -> 391 ms/frame.
     local threads="${PERCORSO_THREADS:-4}"
+    # PERCORSO_DSG_INTERVAL: seconds between Hydra graph updates the node processes
+    # (newest wins). Hydra sends one ~10 MB graph per frame; processing each held the
+    # node's GIL ~48 % of the time (383 -> 266 ms/frame at 3 s, pipeline-speed 2026-10-07).
     # `env` rather than `export ...;` because svc_start execs the command string.
     local cmd="env OMP_NUM_THREADS=$threads MKL_NUM_THREADS=$threads OPENBLAS_NUM_THREADS=$threads OPENCV_FOR_THREADS_NUM=$threads \
           ros2 launch percorso_perception_ros egg_daaam_hydra.launch.yaml \
@@ -680,6 +683,7 @@ cmd_pipeline() {
           cosmos_hoi_video_sampling:='$cosmos_sampling' \
           cosmos_hoi_media_root:='$PROJECT' \
           defer_dsg_processing:=false \
+          dsg_update_min_interval_s:=${PERCORSO_DSG_INTERVAL:-3.0} \
           enable_live_hoi_query:=true \
           live_buffer_sec:=30.0 \
           live_bridge_port:=$BRIDGE_PORT \
