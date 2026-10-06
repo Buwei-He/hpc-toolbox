@@ -660,7 +660,15 @@ cmd_pipeline() {
     # the PAPER configs to the demo run — an edit in percorso-perception-ros/config
     # would have had no effect at all. The default is also self-correcting: it
     # follows the overlay instead of an absolute path that can rot.
-    local cmd="ros2 launch percorso_perception_ros egg_daaam_hydra.launch.yaml \
+    # Thread caps for every process the launch starts (node, grounding and assignment
+    # workers). torch and OpenCV otherwise start one thread per hyperthread of the
+    # allocation in each process, which together with Hydra's own threads oversubscribes
+    # the job's cores. Measured 2026-10-06 (experiments/pipeline-speed): BoT-SORT ReID
+    # 1.7 s/frame under that contention vs 57 ms capped; live node 588 -> 391 ms/frame.
+    local threads="${PERCORSO_THREADS:-4}"
+    # `env` rather than `export ...;` because svc_start execs the command string.
+    local cmd="env OMP_NUM_THREADS=$threads MKL_NUM_THREADS=$threads OPENBLAS_NUM_THREADS=$threads OPENCV_FOR_THREADS_NUM=$threads \
+          ros2 launch percorso_perception_ros egg_daaam_hydra.launch.yaml \
           depth_scale:=1000.0 \
           exit_after_clock:=false \
           verbosity:=1 \
