@@ -156,11 +156,9 @@ require_job() {
 # (default reason2, or $PERCORSO_COSMOS). Each writes its own URL file so
 # both jobs can be up at once without clobbering each other — see
 # jobs/cosmos-reason2/setup.sh and jobs/cosmos3-nano-reasoner/setup.sh.
-# Fields: job/served-model name, URL file, port, HOI video sampling mode.
-# The 4th field is the daaam `cosmos_hoi_video_sampling` the server accepts:
-# the nano profile's vLLM 0.27.1 rejects the "processor" mode's
-# mm_processor_kwargs video request (400 "Failed to apply Qwen3VLProcessor"),
-# so every HOI clip silently failed on it; "loader_and_processor" works there.
+# Fields: job/served-model name, URL file, port. The vLLM video sampling mode is no longer a
+# per-backend field: since 2026-10-08 the pipeline sends one request shape that gives 4 fps on
+# both servers (daaam cosmos_client.VIDEO_SAMPLING); the 4th field stays for the readers below.
 cosmos_backend_spec() {
     case "${1:-${PERCORSO_COSMOS:-reason2}}" in
         reason2) printf '%s\t%s/.cosmos_url\t8000\tprocessor\n' cosmos-reason2 "$PROJECT" ;;
@@ -645,7 +643,7 @@ cmd_pipeline() {
     fi
 
     printf "percorso-demo pipeline — run '%s' on %s\n" "$label" "$(hostname -s)"
-    note "cosmos:  $cu (backend: ${PERCORSO_COSMOS:-reason2}, model: $cosmos_jobname, video sampling: $cosmos_sampling)"
+    note "cosmos:  $cu (backend: ${PERCORSO_COSMOS:-reason2}, model: $cosmos_jobname)"
     note "bridge:  http://$(hostname -s):$BRIDGE_PORT"
     note "frames: percorso-demo stream (remote robot), or bag (local)"
     note "from your laptop:  ssh-helper connect <node> bridge"
@@ -666,11 +664,11 @@ cmd_pipeline() {
     # the job's cores. Measured 2026-10-06 (experiments/pipeline-speed): BoT-SORT ReID
     # 1.7 s/frame under that contention vs 57 ms capped; live node 588 -> 391 ms/frame.
     local threads="${PERCORSO_THREADS:-4}"
-    # PERCORSO_HUMAN_MASK_POLICY keep|override|tag and PERCORSO_HUMAN_CLIP_TRIGGER detector|shared:
-    # the human-mask experiment (experiments/human-mask-policy/PLAN.md); defaults = today's behaviour.
-    # PERCORSO_DSG_INTERVAL: seconds between Hydra graph updates the node processes
-    # (newest wins). Hydra sends one ~10 MB graph per frame; processing each held the
-    # node's GIL ~48 % of the time (383 -> 266 ms/frame at 3 s, pipeline-speed 2026-10-07).
+    # Per-run switches, empty = the value in percorso-perception/config/pipeline_config.yaml:
+    #   PERCORSO_HUMAN_MASK_POLICY keep|override|tag  (experiments/human-mask-policy/PLAN.md)
+    #   PERCORSO_REID_BACKEND dinov2|clip|boxmot|none (experiments/pipeline-speed)
+    # Everything else about clips, Cosmos HOI, linking and the DSG update interval is
+    # owned by that yaml; the launch only carries the Cosmos server wiring.
     # `env` rather than `export ...;` because svc_start execs the command string.
     local cmd="env OMP_NUM_THREADS=$threads MKL_NUM_THREADS=$threads OPENBLAS_NUM_THREADS=$threads OPENCV_FOR_THREADS_NUM=$threads \
           ros2 launch percorso_perception_ros egg_daaam_hydra.launch.yaml \
@@ -678,28 +676,24 @@ cmd_pipeline() {
           exit_after_clock:=false \
           verbosity:=1 \
           sigterm_timeout:=180 sigkill_timeout:=30 \
-          save_human_clips:=true \
-          enable_cosmos_hoi_processing:=true \
           cosmos_hoi_base_url:='$cu' \
           cosmos_hoi_model:='$cosmos_jobname' \
-          cosmos_hoi_video_sampling:='$cosmos_sampling' \
           cosmos_hoi_media_root:='$PROJECT' \
           defer_dsg_processing:=false \
-          dsg_update_min_interval_s:=${PERCORSO_DSG_INTERVAL:-3.0} \
-          human_mask_policy:=${PERCORSO_HUMAN_MASK_POLICY:-keep} \
-          human_clip_trigger:=${PERCORSO_HUMAN_CLIP_TRIGGER:-detector} \
           enable_live_hoi_query:=true \
-          live_buffer_sec:=30.0 \
           live_bridge_port:=$BRIDGE_PORT \
           output_run_prefix:=demo_${label}_ \
           $voice_router_arg"
+    # ros2 launch rejects an empty 'name:=', so a switch is passed only when set
+    [ -n "${PERCORSO_HUMAN_MASK_POLICY:-}" ] && cmd="$cmd human_mask_policy:=$PERCORSO_HUMAN_MASK_POLICY"
+    [ -n "${PERCORSO_REID_BACKEND:-}" ]      && cmd="$cmd reid_backend:=$PERCORSO_REID_BACKEND"
     [ -n "$ODOM_FRAME" ]   && cmd="$cmd odom_frame:='$ODOM_FRAME'"
     [ -n "$SENSOR_FRAME" ] && cmd="$cmd sensor_frame:='$SENSOR_FRAME'"
     if [ -n "$ODOM_FRAME$SENSOR_FRAME" ]; then
         note "frame override: odom_frame=${ODOM_FRAME:-<launch default>} sensor_frame=${SENSOR_FRAME:-<launch default>}"
     fi
     # Extra launch arguments, appended as given, for opt-in node options (e.g.
-    # captioner:=cosmos, or the Pass 1 latency ones: cosmos_hoi_pass1_input:=stream).
+    # captioner:=cosmos). Pass 1 input / early grounding are yaml settings (human.hoi).
     # Empty by default, which launches exactly as before.
     if [ -n "${PERCORSO_LAUNCH_EXTRA:-}" ]; then
         cmd="$cmd $PERCORSO_LAUNCH_EXTRA"
